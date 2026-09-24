@@ -13,15 +13,18 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
 
 class XTLuaArrayFloat{
     public:
-    float value=0.0f;
+    // Keep int-array values exact across the worker bridge (float loses int32 bits).
+    double value=0.0;
     void * ref=nullptr;
     int type=0;
     int index=-1;
     bool get=false;//do we get this data
     bool set=false;//do we set this data
+    std::uint64_t version=0; // Worker write generation for nonblocking SDK flush.
 };
 
 class XTLuaCharArray
@@ -32,6 +35,7 @@ class XTLuaCharArray
     int index=-1;
     bool get=false;//do we get this data
     bool set=false;//do we set this data
+    std::uint64_t version=0; // Incremented for every worker write, including empty strings.
 };
 class XTLuaChars
 {

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <imgui.h>
 #include <deque>
+#include "../xtlua2_imgui.h"
 
 extern "C" {
   #include "lua.h"
@@ -81,12 +82,16 @@ const char * RunString(const char* szLua) {
 
 #define IMGUI_FUNCTION_DRAW_LIST(name) \
 static int impl_draw_list_##name(lua_State *L) { \
+  if (!xtlua2_imgui_frame_active(L)) \
+    return luaL_error(L, "imgui functions require an active xlua2_main draw callback"); \
   int max_args = lua_gettop(L); \
   int arg = 1; \
   int stackval = 0;
 
 #define IMGUI_FUNCTION(name) \
 static int impl_##name(lua_State *L) { \
+  if (!xtlua2_imgui_frame_active(L)) \
+    return luaL_error(L, "imgui functions require an active xlua2_main draw callback"); \
   int max_args = lua_gettop(L); \
   int arg = 1; \
   int stackval = 0;
@@ -497,12 +502,15 @@ static void PushImguiEnums(lua_State* lState, const char* tableName) {
 };
 
 
-void LoadImguiBindings() {
-  if (!lState) {
-    fprintf(stderr, "You didn't assign the global lState, either assign that or refactor LoadImguiBindings and RunString\n");
-  }
-  lua_newtable(lState);
-  luaL_setfuncs(lState, imguilib, 0);
-  PushImguiEnums(lState, "constant");
-  lua_setglobal(lState, "imgui");
+// Registration is per Lua state. RunString retains its historical global
+// lState, but the XTLua xlua2_main host never uses that example helper.
+void LoadImguiBindings(lua_State* L) {
+  lua_newtable(L);
+  luaL_setfuncs(L, imguilib, 0);
+  // The host owns frame lifetime. Letting Lua call EndFrame() here would
+  // invalidate the frame before the panel draw callback renders it.
+  lua_pushnil(L);
+  lua_setfield(L, -2, "EndFrame");
+  PushImguiEnums(L, "constant");
+  lua_setglobal(L, "imgui");
 }

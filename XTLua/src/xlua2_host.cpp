@@ -91,17 +91,3 @@ extern "C" int XLuaReloadOnFlightChange(lua_State * L)
 	xlua2_host_reload_on_flight_change();
 	return 0;
 }
-
-extern "C" int XLuaCreateImguiWindow(lua_State * L)
-{
-	return luaL_error(
-		L,
-		"XLuaCreateImguiWindow is not supported by this XTLua build");
-}
-
-extern "C" int XLuaDestroyImguiWindow(lua_State * L)
-{
-	return luaL_error(
-		L,
-		"XLuaDestroyImguiWindow is not supported by this XTLua build");
-}

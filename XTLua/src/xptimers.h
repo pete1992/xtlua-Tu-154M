@@ -19,8 +19,9 @@ typedef void (* xlua_timer_f)(void * ref);
 struct xlua_timer;
 struct xlua2_timer;
 
-// Legacy XTLua/XLua 1 timers. These APIs and their two original timer lists are
-// intentionally kept separate from the per-interpreter XLua 2 timers below.
+// XTLua timer APIs: xtlua_worker uses xtlua_* on the worker, while xtlua_main
+// uses xlua_* on the X-Plane thread. Their separate lists are distinct from
+// the per-interpreter xlua2_main timers below.
 xlua_timer *		xlua_create_timer(xlua_timer_f func, void * ref);
 void				xlua_run_timer(xlua_timer * t, double delay, double repeat);
 int				xlua_is_timer_scheduled(xlua_timer * t);
@@ -31,6 +32,7 @@ int				xtlua_is_timer_scheduled(xlua_timer * t);
 double			xtlua_get_timer_remaining(xlua_timer * t);
 void xlua_do_timers_for_time(double now,bool isPaused);
 void xtlua_do_timers_for_time(double now,bool isPaused);
+bool xlua_is_main_timer_dispatch_active(); // Main-thread lifecycle/reentrancy guard.
 void xtlua_timer_cleanup();
 double xlua_get_simulated_time();
 

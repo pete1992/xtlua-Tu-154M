@@ -122,7 +122,7 @@ void setup_std_vars(lua_State * L, int dbg)
 
 	// lua_helpers is also used by the separate generated-glue host, whose
 	// states do not have an XTLua runtime marker. Preserve that host's public
-	// version fallback, but never let an owned legacy worker opt itself into
+	// version fallback, but never let an owned xtlua_worker state opt itself into
 	// direct main-thread SDK calls by overwriting a Lua global.
 	if(!runtime_is_owned)
 	{

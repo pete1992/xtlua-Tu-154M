@@ -4,7 +4,7 @@
 
 #include <XPLMPlugin.h>
 #include <XPLMUtilities.h>
-#define PLUGINVERSION "2.4.7"
+#define PLUGINVERSION "2.4.9"
 int     XTLuaXPluginStart(char *		outSig);
 void	XTLuaXPluginStop(void);
 void XTLuaXPluginDisable(void);

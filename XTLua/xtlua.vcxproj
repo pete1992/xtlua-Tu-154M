@@ -11,29 +11,66 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\ImgWindow\WavFile.cpp" />
-    <ClCompile Include="src\ImgWindow\XOGLUtils.cpp" />
+    <ClCompile Include="src\ImgWindow\ImgFontAtlas.cpp" />
+    <ClCompile Include="src\ImgWindow\ImgWindow.cpp" />
+    <ClCompile Include="src\imgui\imgui.cpp" />
+    <ClCompile Include="src\imgui\imgui_demo.cpp" />
+    <ClCompile Include="src\imgui\imgui_draw.cpp" />
+    <ClCompile Include="src\imgui\imgui_tables.cpp" />
+    <ClCompile Include="src\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="src\imgui_lua_bindings\imgui_lua_bindings.cpp" />
+    <ClCompile Include="src\imgui4xp.cpp" />
+    <ClCompile Include="src\imgui_starter_window.cpp" />
     <ClCompile Include="src\lua_helpers.cpp" />
     <ClCompile Include="src\module.cpp" />
     <ClCompile Include="src\SerialWidget.cpp" />
+    <ClCompile Include="src\shared_xpfuncs.cpp" />
     <ClCompile Include="src\xlua.cpp" />
+    <ClCompile Include="src\xlua2_host.cpp" />
+    <ClCompile Include="src\xlua_command_bindings.cpp" />
     <ClCompile Include="src\xluaplugin.cpp" />
     <ClCompile Include="src\xpcommands.cpp" />
     <ClCompile Include="src\xpdatarefs.cpp" />
     <ClCompile Include="src\xpmtdatarefs.cpp" />
     <ClCompile Include="src\xpfuncs.cpp" />
     <ClCompile Include="src\xptimers.cpp" />
+    <ClCompile Include="src\xtlua_render_bridge.cpp" />
+    <ClCompile Include="src\xtlua2_imgui.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XLua_Register_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMCamera_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMDataAccess_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMDefs_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMDisplay_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMGraphics_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMInstance_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMMap_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMMenus_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMNavigation_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMPanelGraphics_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMPlanes_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMPlugin_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMProcessing_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMScenery_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMSound_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMUtilities_glue.cpp" />
+    <ClCompile Include="..\SDK\XLua_glue\XPLMWeather_glue.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\lua_sdk\lauxlib.h" />
     <ClInclude Include="..\lua_sdk\lua.h" />
     <ClInclude Include="..\lua_sdk\luaconf.h" />
     <ClInclude Include="..\lua_sdk\lualib.h" />
-    <ClInclude Include="src\ImgWindow\WavFile.h" />
-    <ClInclude Include="src\ImgWindow\XOGLUtils.h" />
+    <ClInclude Include="src\ImgWindow\ImgFontAtlas.h" />
+    <ClInclude Include="src\ImgWindow\ImgWindow.h" />
+    <ClInclude Include="src\imgui4xp.h" />
+    <ClInclude Include="src\imgui_starter_window.h" />
     <ClInclude Include="src\lua_helpers.h" />
     <ClInclude Include="src\module.h" />
     <ClInclude Include="src\SerialWidget.h" />
+    <ClInclude Include="src\shared_lua_helpers.h" />
+    <ClInclude Include="src\shared_xpfuncs.h" />
+    <ClInclude Include="src\xlua2_host.h" />
+    <ClInclude Include="src\xlua_command_bindings.h" />
     <ClInclude Include="src\xluaplugin.h" />
     <ClInclude Include="src\xpcommands.h" />
     <ClInclude Include="src\xpdatarefs.h" />
@@ -41,6 +78,8 @@
     <ClInclude Include="src\xpmtdatatypes.h" />
     <ClInclude Include="src\xpfuncs.h" />
     <ClInclude Include="src\xptimers.h" />
+    <ClInclude Include="src\xtlua_render_bridge.h" />
+    <ClInclude Include="src\xtlua2_imgui.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <SccProjectName />
@@ -59,7 +98,7 @@
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -71,7 +110,7 @@
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
-    <PlatformToolset>v142</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -171,14 +210,13 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <StringPooling>true</StringPooling>
-      <FunctionLevelLinking>true</FunctionLevelLinking>
       <Optimization>MaxSpeed</Optimization>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <WarningLevel>Level3</WarningLevel>
-      <AdditionalIncludeDirectories>..\SDK\CHeaders\XPLM;..\SDK\CHeaders\Widgets;..\lua_sdk;include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;SIMDATA_EXPORTS;IBM=1;XPLM200=1;XPLM210=1;XPLM300=1;XPLM301=1;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level2</WarningLevel>
+      <AdditionalIncludeDirectories>src;include;..\SDK\XLua_glue;..\SDK\CHeaders\XPLM;..\SDK\CHeaders\Widgets;..\lua_sdk;src\imgui;src\imgui\misc\cpp;src\ImgWindow;src\imgui\misc\freetype;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;SIMDATA_EXPORTS;APL=0;IBM=1;LIN=0;XPLM200=1;XPLM210=1;XPLM300=1;XPLM301=1;XPLM302=1;XPLM303=1;XPLM400=1;XPLM410=1;XPLM420=1;XPLM430=1;XPLM440=1;XPLMPG1=1;IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1;LUA_BINDINGS_LOCAL_STATE=1;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AssemblerListingLocation>.\Release\64\</AssemblerListingLocation>
       <PrecompiledHeaderOutputFile>.\Release\64\xlua.pch</PrecompiledHeaderOutputFile>
       <PrecompiledHeader>
@@ -187,7 +225,10 @@
       <ProgramDataBaseFileName>.\Release\64\</ProgramDataBaseFileName>
       <StructMemberAlignment>Default</StructMemberAlignment>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <WholeProgramOptimization>true</WholeProgramOptimization>
+      <ControlFlowGuard>false</ControlFlowGuard>
     </ClCompile>
     <Midl>
       <SuppressStartupBanner>true</SuppressStartupBanner>
@@ -208,7 +249,7 @@
       <LinkDLL>true</LinkDLL>
       <SubSystem>Console</SubSystem>
       <ImportLibrary>.\Release\64\xlua.lib</ImportLibrary>
-      <AdditionalLibraryDirectories>SDK\Libraries\Win;Lua_sdk;C:\vcpkg\installed\x64-windows-static\include;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\SDK\Libraries\Win;..\lua_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Opengl32.lib;..\SDK\Libraries\Win\XPLM_64.lib;..\SDK\Libraries\Win\XPWidgets_64.lib;..\lua_sdk\lua51.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
@@ -267,8 +308,8 @@
       <Optimization>Disabled</Optimization>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <DebugInformationFormat>OldStyle</DebugInformationFormat>
-      <AdditionalIncludeDirectories>..\SDK\CHeaders\XPLM;..\SDK\CHeaders\Widgets;..\lua_sdk;include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;SIMDATA_EXPORTS;IBM=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>src;include;..\SDK\XLua_glue;..\SDK\CHeaders\XPLM;..\SDK\CHeaders\Widgets;..\lua_sdk;src\imgui;src\imgui\misc\cpp;src\ImgWindow;src\imgui\misc\freetype;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;SIMDATA_EXPORTS;APL=0;IBM=1;LIN=0;XPLM200=1;XPLM210=1;XPLM300=1;XPLM301=1;XPLM302=1;XPLM303=1;XPLM400=1;XPLM410=1;XPLM420=1;XPLM430=1;XPLM440=1;XPLMPG1=1;IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1;LUA_BINDINGS_LOCAL_STATE=1;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AssemblerListingLocation>.\Debug\64\</AssemblerListingLocation>
       <PrecompiledHeaderOutputFile>.\Debug\64\xlua.pch</PrecompiledHeaderOutputFile>
       <PrecompiledHeader>
@@ -277,6 +318,8 @@
       <ProgramDataBaseFileName>.\Debug\64\</ProgramDataBaseFileName>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <StructMemberAlignment>Default</StructMemberAlignment>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
     </ClCompile>
     <Midl>
       <SuppressStartupBanner>true</SuppressStartupBanner>
@@ -298,7 +341,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Console</SubSystem>
       <ImportLibrary>.\Debug\64\xlua.lib</ImportLibrary>
-      <AdditionalLibraryDirectories>SDK\Libraries\Win;lua_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\SDK\Libraries\Win;..\lua_sdk;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Opengl32.lib;..\SDK\Libraries\Win\XPLM_64.lib;..\SDK\Libraries\Win\XPWidgets_64.lib;..\lua_sdk\lua51.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
