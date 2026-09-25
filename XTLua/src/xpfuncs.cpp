@@ -44,7 +44,6 @@
 struct xtlua_notify_cb_t {
 	lua_State *		L;
 	int				slot;
-	module *		owner;
 };
 
 // Given an interp and a stack arg that is a lua function/closure,
@@ -78,7 +77,6 @@ xtlua_notify_cb_t * wrap_lua_func(lua_State * L, int idx)
 		return NULL;
 	}
 	cb->L = L;
-	cb->owner = me;
 	lua_pushvalue (L, idx);
 	cb->slot = luaL_ref(L, LUA_REGISTRYINDEX);		
 	return cb;
@@ -102,10 +100,6 @@ lua_State * setup_lua_callback(void * ref)
 	if(ref == NULL) 
 		return NULL;
 	xtlua_notify_cb_t * cb = (xtlua_notify_cb_t *) ref;
-	// Constructor-failure teardown may already have closed cb->L while its
-	// module and tracked callback record remain alive until host cleanup.
-	if(cb->owner == NULL || cb->owner->is_closing())
-		return NULL;
 	lua_rawgeti (cb->L, LUA_REGISTRYINDEX, cb->slot);
 	if(!lua_isfunction(cb->L, -1))
 	{
@@ -772,39 +766,14 @@ static int XLuaIsTimerScheduled(lua_State * L)
 	FUNC(XLuaCreateDataRef)\
 	FUNC(XLuaExistingDataRef)
 
-static int classic_binding_dispatch(lua_State * L)
-{
-	module * owner = module::module_from_interp(L);
-	if(owner == NULL)
-		return luaL_error(L, "module context unavailable");
-	if(owner->is_closing())
-		return luaL_error(L, "XTLua module is closing; classic bindings are unavailable");
-
-	// Keep a Lua C function value, not a function-pointer/object-pointer cast.
-	// The gate precedes every original binding, including handle validation:
-	// finalizers may still hold lightuserdata whose C++ object was retired.
-	lua_CFunction function = lua_tocfunction(L, lua_upvalueindex(1));
-	if(function == NULL)
-		return luaL_error(L, "XTLua classic binding target unavailable");
-	return function(L);
-}
-
-static void register_classic_binding(lua_State * L, const char * name, lua_CFunction function)
-{
-	lua_pushcfunction(L, function);
-	lua_pushcclosure(L, classic_binding_dispatch, 1);
-	lua_setglobal(L, name);
-}
-
 void	add_xpfuncs_to_interp(lua_State * L,bool isXT)
 {
 	#define FUNC(x) \
-		register_classic_binding(L,#x,x);
+		lua_register(L,#x,x);
 	if(isXT){	
 		XT_FUNC_LIST;
 	}
 	else{
 		XL_FUNC_LIST;
 	}
-	#undef FUNC
 }

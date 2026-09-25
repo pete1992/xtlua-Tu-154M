@@ -7,11 +7,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
-#include <deque>
-#include <mutex>
-#include <thread>
 #include <unordered_map>
-#include <utility>
 
 int notify_cb_t::s_nil_ref_count = -100;
 
@@ -50,22 +46,6 @@ namespace {
 // handed to XPLM; the shared_ptr value keeps the Lua registry references alive.
 std::unordered_map<const notify_cb_t *, std::shared_ptr<notify_cb_t>> g_callbacks;
 
-// The queue owns only text. In particular, draining finalizer/unload messages
-// never dereferences a module or Lua state which has already been destroyed.
-std::mutex g_log_mutex;
-std::deque<std::string> g_log_queue;
-std::thread::id g_log_main_thread;
-bool g_log_draining = false; // Protected by g_log_mutex, including reentry.
-
-struct log_drain_guard {
-
-	~log_drain_guard()
-	{
-		std::lock_guard<std::mutex> lock(g_log_mutex);
-		g_log_draining = false;
-	}
-};
-
 int panic_handler(lua_State * L)
 {
 	const char * message = lua_tostring(L, -1);
@@ -75,36 +55,6 @@ int panic_handler(lua_State * L)
 }
 
 } // namespace
-
-void xtlua_log_set_main_thread()
-{
-	std::lock_guard<std::mutex> lock(g_log_mutex);
-	g_log_main_thread = std::this_thread::get_id();
-}
-
-void xtlua_queue_log(std::string message)
-{
-	std::lock_guard<std::mutex> lock(g_log_mutex);
-	g_log_queue.push_back(std::move(message));
-}
-
-std::size_t xtlua_flush_log_queue()
-{
-	std::deque<std::string> batch;
-	{
-		std::lock_guard<std::mutex> lock(g_log_mutex);
-		if(g_log_main_thread != std::this_thread::get_id() ||
-		   g_log_draining || g_log_queue.empty())
-			return 0;
-		g_log_draining = true;
-		batch.swap(g_log_queue);
-	}
-
-	const log_drain_guard guard;
-	for(const std::string& message : batch)
-		XPLMDebugString(message.c_str());
-	return batch.size();
-}
 
 std::string get_log_prefix(char level)
 {
@@ -151,7 +101,9 @@ int log_message(lua_State * L, const char * format, ...)
 		}
 	}
 	output += buffer;
-	xtlua_queue_log(std::move(output));
+	// Worker callback errors can reach this direct XPLM call. Keep that known
+	// boundary exception visible until logging is marshalled to the main thread.
+	XPLMDebugString(output.c_str());
 	return result;
 }
 

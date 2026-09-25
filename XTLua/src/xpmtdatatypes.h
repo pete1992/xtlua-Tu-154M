@@ -35,7 +35,6 @@ class XTLuaCharArray
     int index=-1;
     bool get=false;//do we get this data
     bool set=false;//do we set this data
-    std::uint64_t version=0; // Incremented for every worker write, including empty strings.
 };
 class XTLuaChars
 {

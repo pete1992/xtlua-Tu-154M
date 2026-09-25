@@ -1,9 +1,61 @@
 XTLua
 ====
 
-XTLua is a modification of XLua which runs lua - specifically before_physics and after_physics lua functions in a worker thread aysnchronously to X-Plane.
+XTLua is an asynchronous Lua runtime for X-Plane. Its `xtlua_worker` modules run
+`before_physics()` and `after_physics()` on a worker thread, independently of
+the X-Plane frame loop. This leaves room for more complex Lua system logic
+without executing that logic on the X-Plane main thread.
 
-The goal is to facilitate more complex Lua calcuations without impacting the X-Plane frame rate. The Lua bindings of XLua have been replaced with xtluaDefs in xpdatarefs.cpp which synchronize the current variable states of XTLua with X-Plane once each flight model frame.
+For the current local XLua capability comparison, file-by-file optimizations,
+API additions and remaining validation, see
+[XLUA_PARITY_README.md](XLUA_PARITY_README.md) and
+[GRAPHICS_API_README.md](GRAPHICS_API_README.md). This source update has not
+been compiled or tested in X-Plane.
+
+### Runtime modes (2.4.x)
+
+| Mode | Thread | XPLM access | Script location |
+| --- | --- | --- | --- |
+| `xtlua_worker` | XTLua worker | Buffered/synchronized XTLua interfaces; no direct XPLM bindings | `plugins/xtlua/scripts/<module>/<module>.lua` without an XLua 2 marker |
+| `xtlua_main` | X-Plane main thread | Direct XLua-compatible bindings | `plugins/xtlua/init/scripts/<module>/<module>.lua` |
+| `xlua2_main` | X-Plane main thread | Direct generated XLua 2 / SDK 4.4 bindings | `plugins/xtlua/scripts/<module>/<module>.lua` with the exact first line `--[[ XLua 2.0 ]]` |
+
+The worker/main-thread boundary is implemented by the buffered DataRef and
+command interfaces in `XTLua/src/xpdatarefs.cpp` and
+`XTLua/src/xpmtdatarefs.cpp`. Simulator state is exchanged
+at the flight-model boundary. The original XLua documentation below is retained
+as API background; its frame-by-frame scheduling description does **not**
+describe `xtlua_worker`.
+
+Worker logs now enter a text-only FIFO; only its main-thread drain calls
+`XPLMDebugString()`. External scalar and string DataRefs use versioned cache
+transfers, and command phases are ordered events rather than coalesced values.
+SDK calls and Lua callbacks execute outside the worker cache/queue locks.
+FMS, camera, serial UI and control-object requests are also marshalled to the
+main thread. See [THREADING_README.md](THREADING_README.md) for the 2.4.9
+thread-boundary changes, lifecycle rules, limitations and pending tests.
+
+### Display and graphics boundary
+
+`xtlua_worker` computes display state but must not call XPLM graphics or ImGui.
+It publishes an immutable, latest-frame display snapshot with
+`XTLuaPublishRenderBuffer(channel, state)`. Each channel uses three fixed,
+value-owned slots and a guaranteed lock-free 32-bit SPSC exchange: the Worker
+only builds its `worker_buffer`, while the X-Plane thread only reads its
+`render_buffer`. At the main-thread frame boundary XTLua promotes the latest
+complete slot once per channel; all readers of that channel in the frame
+therefore see the same snapshot.
+An `xlua2_main` draw callback obtains its own Lua copy with
+`XLuaGetRenderBuffer(channel)` and renders through the local
+PanelGraphics/ImGui path. Direct SDK
+PanelGraphics and avionics bindings remain available only to `xlua2_main`;
+`xtlua_main` retains its classic XTLua bindings.
+
+Worker array DataRefs support whole-array `get_values()`/`set_values()` and a
+dynamic `.len`; main-thread SDK refresh uses a full-array snapshot and flushes
+worker writes in contiguous dirty ranges. The separate render bridge carries
+display state, not XPLM handles or draw commands. See [PHASE2_README.md](PHASE2_README.md)
+for API examples, limits and verification status.
 
 
 XLua
@@ -66,7 +118,8 @@ Type can be one of
 
 create_dataref and create_command can only be used inside a script in init/script/ 
 
-XTLua main scripts can interface with commands and datarefs using
+`xtlua_main` scripts can interface with commands and datarefs using
+
 - **find_command(name)**
 - **replace_command(name, handler)**
 - **wrap_command(name, before_handler, after_handler)**
@@ -184,9 +237,9 @@ Most work is done in response to major callbacks - functions that are automatica
 * `aircraft_unload()` - run once when your aircraft is unloaded.
 * `flight_start()` - run once each time a flight is started.  The aircraft is already initialized and can thus be customized.  This is always called after `aircraft_load` has been run at least once.
 * `flight_crash()` - called if X-Plane detects that the user has crashed the airplane.
-* `before_physics()` - called every frame that the sim is not paused and not in replay, before physics are calculated
-* `after_physics()` - called every frame that the sim is not paused and not in replay, after physics are calculated
-* `after_replay()` - called every frame that the sim is in replay mode, regardless of pause status.
+* `before_physics()` - `xtlua_worker`: called in the independent worker cycle while active and unpaused, not once per X-Plane frame. `xlua2_main`: called on the X-Plane thread before flight-model physics when not paused or in replay.
+* `after_physics()` - `xtlua_worker`: called in that same independent worker cycle while active and unpaused. `xtlua_main` and `xlua2_main`: called on the X-Plane thread after flight-model physics when not paused or in replay.
+* `after_replay()` - `xlua2_main`: called on the X-Plane thread during replay.
 
 These functions take no arguments.
 
@@ -312,4 +365,3 @@ Using "Developer > Reload the Current Aircraft and Art" X-Plane menu will also r
 
 * **Q:** Is there a way to compile a XLua script in a binary plugin (xpl file)?
 * **A:** No. If you want or need to encrypt Lua scripts, you need to use SASL.
-

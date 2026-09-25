@@ -95,7 +95,6 @@ void xlua_add_callout(string callout);
 void xlua_setLoadStatus(int loadStatus);
 double xlua_get_simulated_time();
 bool xlua_ispaused(); // Cached pause state read by xtlua_worker, not an XPLM call.
-bool xtlua_is_sdk_dispatch_active(); // Main-thread-only lifecycle/reentrancy guard.
 string			xtlua_dref_get_string(xtlua_dref * who);
 void			xtlua_dref_set_string(xtlua_dref * who, const string& value);
 string			xlua_dref_get_string(xlua_dref * who);

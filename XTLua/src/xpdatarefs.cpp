@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cmath>
 #include "xpcommands.h"
-#include "xptimers.h"
 #define XPLM200 1
 #include <XPLMUtilities.h>
 //#include <XPLMProcessing.h>
@@ -27,8 +26,6 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
-#include <atomic>
-#include <memory>
 
 
 #include <XPLMUtilities.h>
@@ -60,7 +57,7 @@ static int xlua_round_to_int(double value)
 
 static XTLuaDataRefs xtluaDefs;
 
-static std::atomic<bool> active{false}; // main publishes SDK accessor availability
+static bool active=false; //local marker to enable/disable dataref read and writes during startup and shutdown
 struct	xlua_dref {
 	xlua_dref *				m_next;
 	string					m_name;
@@ -81,16 +78,6 @@ static xlua_dref *		l_drefs = NULL;
 
 
 static xtlua_dref *		s_drefs = NULL;
-static std::mutex worker_dref_list_mutex;
-
-static std::vector<xtlua_dref *> worker_drefs_snapshot()
-{
-	std::lock_guard<std::mutex> lock(worker_dref_list_mutex);
-	std::vector<xtlua_dref *> result;
-	for(xtlua_dref * d = s_drefs; d; d = d->m_next)
-		result.push_back(d);
-	return result;
-}
 static std::mutex xlua_data_mutex;
 static std::mutex xlua_change_mutex;
 //for change locking
@@ -510,7 +497,7 @@ static void resolve_xp_dref(xlua_dref * d)
 
 void			xlua_validate_drefs()
 {
-	for(xtlua_dref * f : worker_drefs_snapshot())
+	for(xtlua_dref * f = s_drefs; f; f = f->m_next)
 	{
 	#if MOBILE
 		assert(f->m_dref != NULL);
@@ -564,9 +551,6 @@ xlua_dref *		xlua_find_dref(const char * name)
 }
 xtlua_dref *		xtlua_find_dref(const char * name)
 {
-	// Only immutable list nodes are published here. Resolution uses its own
-	// queue and release-publishes binding metadata later on the main thread.
-	std::lock_guard<std::mutex> lock(worker_dref_list_mutex);
 	for(xtlua_dref * f = s_drefs; f; f = f->m_next)
 	if(f->m_name == name)
 	{
@@ -689,8 +673,6 @@ xlua_dref *		xlua_create_dref(const char * name, xtlua_dref_type type, int dim, 
 
 xtlua_dref_type	xtlua_dref_get_type(xtlua_dref * who)
 {
-	if(!who || !who->m_resolved.load(std::memory_order_acquire))
-		return xlua_none;
 	if(who->m_types & xplmType_Data)
 		return xlua_string;
 	if(who->m_index >= 0)
@@ -738,8 +720,6 @@ void			xtlua_dref_postUpdate(){
 }
 int	xtlua_dref_get_dim(xtlua_dref * who)
 {
-	if(!who || !who->m_resolved.load(std::memory_order_acquire))
-		return 0;
 	//if(who->m_ours)
 	//	return who->m_array_storage.size();
 	if(who->m_types & xplmType_Data)
@@ -992,8 +972,7 @@ void			xlua_dref_set_string(xlua_dref * d, const string& value)
 }
 double	xtlua_dref_get_number(xtlua_dref * d)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire))
-		return 0.0;
+	
 	if(d->m_index >= 0)
 	{
 		if(d->m_types & (xplmType_FloatArray | xplmType_IntArray))
@@ -1016,8 +995,6 @@ double	xtlua_dref_get_number(xtlua_dref * d)
 
 void			xtlua_dref_set_number(xtlua_dref * d, double value)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire))
-		return;
 	if(d->m_index >= 0)
 	{
 		if(d->m_types & xplmType_FloatArray||d->m_types & xplmType_IntArray)
@@ -1029,14 +1006,13 @@ void			xtlua_dref_set_number(xtlua_dref * d, double value)
 
 	if(d->m_types & xplmType_Float || d->m_types & xplmType_Double || d->m_types & xplmType_Int)
 	{
-		xtluaDefs.XTSetDataf(d, value,d->m_ours);
+		float v = static_cast<float>(value);
+		xtluaDefs.XTSetDataf(d, v,d->m_ours);
 	}
 }
 
 double			xtlua_dref_get_array(xtlua_dref * d, int n)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire))
-		return 0.0;
 	if(n < 0)
 		return 0.0;
 	assert(n >= 0);
@@ -1053,8 +1029,6 @@ double			xtlua_dref_get_array(xtlua_dref * d, int n)
 
 void			xtlua_dref_set_array(xtlua_dref * d, int n, double value)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire))
-		return;
 	if(n < 0)
 		return;
 	assert(n >= 0);
@@ -1073,39 +1047,92 @@ void			xtlua_dref_set_array(xtlua_dref * d, int n, double value)
 
 std::vector<double> xtlua_dref_get_array_values(xtlua_dref * d, int offset, int count)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire) || d->m_index >= 0 || !(d->m_types & (xplmType_FloatArray | xplmType_IntArray)))
+	if(!d || d->m_index >= 0 || !(d->m_types & (xplmType_FloatArray | xplmType_IntArray)))
 		return {};
 	return xtluaDefs.XTGetArrayValues(d, offset, count);
 }
 
 int xtlua_dref_set_array_values(xtlua_dref * d, const std::vector<double>& values, int offset)
 {
-	if(!d || !d->m_resolved.load(std::memory_order_acquire) || d->m_index >= 0 || !(d->m_types & (xplmType_FloatArray | xplmType_IntArray)))
+	if(!d || d->m_index >= 0 || !(d->m_types & (xplmType_FloatArray | xplmType_IntArray)))
 		return -1;
 	return xtluaDefs.XTSetArrayValues(d, values, offset);
 }
 
-string xtlua_dref_get_string(xtlua_dref * d)
+string			xtlua_dref_get_string(xtlua_dref * d)
 {
-	if(!d)
-		return {};
-	const bool special = d->m_name.rfind("xtlua/", 0) == 0;
-	if(!special && !d->m_resolved.load(std::memory_order_acquire))
-		return {};
-	if(special || (d->m_types & xplmType_Data))
-		return xtluaDefs.XTGetString(d);
-	return {};
+	/*if(d->m_ours){
+		xlua_data_mutex.lock();
+		string lVal=xlua_dref_get_string(d->local_dref);
+		int l = lVal.size();
+		if(l > 0)
+		{
+			vector<char>	buf(l);
+			const char * charArray=lVal.c_str();
+			for(int i=0;i<lVal.length()&&i<l;i++){
+                    buf[i]=charArray[i];
+			}
+			xlua_data_mutex.unlock();
+			return string(buf.begin(),buf.end());
+		}
+		xlua_data_mutex.unlock();
+		return string();
+	}*/
+	//printf("get string %s %d\n",d->m_name.c_str(),d->m_types);
+	if(d->m_types & xplmType_Data||d->m_name.rfind("xtlua/", 0) == 0)
+	{
+		int l = xtluaDefs.XTGetDatab(d, NULL, 0, 0,d->m_ours);
+		//printf("get string local %d\n",l);
+		if(l > 0)
+		{
+			vector<char>	buf(l);
+			l = xtluaDefs.XTGetDatab(d, &buf[0], 0, l,d->m_ours);
+			//printf("get string local returned %d\n",l);
+			if(l >= 0 && l <= (int)buf.size())
+			{
+				string retVal=string(buf.data(), static_cast<size_t>(l));
+				//printf("returning %s\n",retVal.c_str());
+				return retVal;
+			}
+		}
+	}
+	return string();
 }
 
-void xtlua_dref_set_string(xtlua_dref * d, const string& value)
+void			xtlua_dref_set_string(xtlua_dref * d, const string& value)
 {
-	if(!d)
-		return;
-	const bool special = d->m_name.rfind("xtlua/", 0) == 0;
-	if(!special && !d->m_resolved.load(std::memory_order_acquire))
-		return;
-	if(special || (d->m_types & xplmType_Data))
-		xtluaDefs.XTSetDatab(d, value);
+	/*if(d->m_ours)
+	{
+		xlua_data_mutex.lock();
+		int l = value.size();
+		if(l > 0)
+		{
+			vector<char>	buf(l);
+			const char * charArray=value.c_str();
+			for(int i=0;i<value.length()&&i<l;i++){
+                    buf[i]=charArray[i];
+			}
+			
+			d->m_string_storage = string(buf.begin(),buf.end());
+		}
+		else
+		{
+			d->m_string_storage =string();
+		}
+		
+		 
+		xlua_data_mutex.unlock();
+		//return;
+	}*/
+	if(d->m_types & xplmType_Data||d->m_name.rfind("xtlua/", 0) == 0)
+	{
+		//const char * begin = value.c_str();
+		//const char * end = begin + value.size();
+		//if(end > begin)
+		{
+			xtluaDefs.XTSetDatab(d, value);
+		}
+	}
 }
 
 // This attempts to re-establish the name->dref link for any unresolved drefs.  This can be used if we declare
@@ -1124,7 +1151,7 @@ void			xlua_relink_all_drefs()
 #endif
 	xtluaDefs.paused_ref=NULL;
 	xtluaDefs.sim_time_ref=NULL;
-	for(xtlua_dref * d : worker_drefs_snapshot())
+	for(xtlua_dref * d = s_drefs; d; d = d->m_next)
 	{
 		if(d->m_dref == NULL)
 		{
@@ -1162,68 +1189,121 @@ void			xlua_relink_all_drefs()
 std::vector<XTCmd*> runQueue;
 std::vector<string> messageQueue;
 std::mutex data_mutex;
-static bool accepting_command_callbacks = true;
-// Main-thread bookkeeping: installing a later wrapper must not register an
-// already installed SDK callback a second time.
-static std::unordered_map<xtlua_cmd *, unsigned> registered_command_handlers;
-enum class worker_handler_slot { pre, main, post };
-
-static void enqueue_command_phase(xtlua_cmd * me, XPLMCommandPhase phase,
-	worker_handler_slot slot)
-{
-	if(!me)
-		return;
-	const float now = static_cast<float>(xtluaDefs.XTGetElapsedTime());
-	std::unique_ptr<XTCmd> command(new XTCmd());
-	std::lock_guard<std::mutex> lock(data_mutex);
-	if(!accepting_command_callbacks)
-		return;
-	if(phase == xplm_CommandBegin)
-		me->m_down_time = now;
-	if(slot == worker_handler_slot::pre)
-	{
-		command->runFunc = me->m_pre_handler;
-		command->m_func_ref = me->m_pre_ref;
-	}
-	else if(slot == worker_handler_slot::main)
-	{
-		command->runFunc = me->m_main_handler;
-		command->m_func_ref = me->m_main_ref;
-	}
-	else
-	{
-		command->runFunc = me->m_post_handler;
-		command->m_func_ref = me->m_post_ref;
-	}
-	if(!command->runFunc)
-		return;
-	command->phase = phase;
-	command->xluaref = me;
-	command->duration = (std::max)(0.0f, now - me->m_down_time);
-	// Notifications are events, not a latest-value cache. CommandOnce delivers
-	// begin/end at the same timestamp. Never deduplicate, filter or drop them.
-	runQueue.push_back(command.get());
-	command.release();
-}
-
 static int xlua_std_pre_handler(XPLMCommandRef c, XPLMCommandPhase phase, void * ref)
 {
-	(void)c;
-	enqueue_command_phase(static_cast<xtlua_cmd *>(ref), phase, worker_handler_slot::pre);
+	xtlua_cmd * me = (xtlua_cmd *) ref;
+	if(phase != xplm_CommandBegin&&xtluaDefs.XTGetElapsedTime()==me->m_down_time)
+		return 0;
+	
+	if(phase == xplm_CommandBegin)
+		me->m_down_time = static_cast<float>(xtluaDefs.XTGetElapsedTime());
+	if(me->m_pre_handler){
+		XTCmd *command =new XTCmd();
+		command->runFunc=me->m_pre_handler;
+		command->m_func_ref=me->m_pre_ref;
+		command->phase=phase;
+		
+		command->xluaref=me;
+		
+		command->duration= static_cast<float>(xtluaDefs.XTGetElapsedTime()) - me->m_down_time;
+		data_mutex.lock();
+		bool add=true;
+		if(phase!=1)
+		for(XTCmd* item:runQueue){
+			if(item->phase==phase&&item->runFunc==command->runFunc&&item->m_func_ref==command->m_func_ref)
+				add=false;
+		}
+		if(runQueue.size()<60&&add){
+			runQueue.push_back(command);
+		}
+		else
+			delete command;
+		data_mutex.unlock();
+	}
+	printf("Pre command %s\n",me->m_name.c_str());
+
+	/*
+	if(me->m_pre_handler)
+		me->m_pre_handler(me, phase, xtluaDefs.XTGetElapsedTime() - me->m_down_time, me->m_pre_ref);*/
 	return 1;
 }
 
 static int xlua_std_main_handler(XPLMCommandRef c, XPLMCommandPhase phase, void * ref)
 {
-	(void)c;
-	enqueue_command_phase(static_cast<xtlua_cmd *>(ref), phase, worker_handler_slot::main);
+	xtlua_cmd * me = (xtlua_cmd *) ref;
+	if(phase != xplm_CommandBegin&&xtluaDefs.XTGetElapsedTime()==me->m_down_time)
+		return 0;
+	
+
+	if(phase == xplm_CommandBegin)
+		me->m_down_time = static_cast<float>(xtluaDefs.XTGetElapsedTime());
+	if(me->m_main_handler){
+		XTCmd *command=new XTCmd();
+		command->runFunc=me->m_main_handler;
+		command->m_func_ref=me->m_main_ref;
+		command->phase=phase;
+		command->xluaref=me;
+		command->duration= static_cast<float>(xtluaDefs.XTGetElapsedTime()) - me->m_down_time;
+		data_mutex.lock();
+		bool add=true;
+		if(phase!=1)
+		for(XTCmd* item:runQueue){
+			if(item->phase==phase&&item->runFunc==command->runFunc&&item->m_func_ref==command->m_func_ref)
+				add=false;
+		}
+		
+		if(runQueue.size()<60&&add){
+			printf("main command %s %d\n",me->m_name.c_str(),phase);
+			runQueue.push_back(command);
+		}
+		else
+			delete command;
+		data_mutex.unlock();
+	}
+	
+	/*if(phase == xplm_CommandBegin)
+		me->m_down_time = xtluaDefs.XTGetElapsedTime();
+	if(me->m_main_handler)
+		me->m_main_handler(me, phase, xtluaDefs.XTGetElapsedTime() - me->m_down_time, me->m_main_ref);*/
 	return 0;
 }
 
 static int xlua_std_post_handler(XPLMCommandRef c, XPLMCommandPhase phase, void * ref)
 {
-	(void)c;
-	enqueue_command_phase(static_cast<xtlua_cmd *>(ref), phase, worker_handler_slot::post);
+	xtlua_cmd * me = (xtlua_cmd *) ref;
+	if(phase != xplm_CommandBegin&&xtluaDefs.XTGetElapsedTime()==me->m_down_time)
+		return 0;
+	
+	if(phase == xplm_CommandBegin)
+		me->m_down_time = static_cast<float>(xtluaDefs.XTGetElapsedTime());
+	if(me->m_post_handler){
+		XTCmd *command = new XTCmd();
+		command->runFunc=me->m_post_handler;
+		command->m_func_ref=me->m_post_ref;
+		command->phase=phase;
+		
+		command->xluaref=me;
+		
+		command->duration= static_cast<float>(xtluaDefs.XTGetElapsedTime()) - me->m_down_time;
+		data_mutex.lock();
+		
+		bool add=true;
+		if(phase!=1)
+		for(XTCmd* item:runQueue){
+			if(item->phase==phase&&item->runFunc==command->runFunc&&item->m_func_ref==command->m_func_ref)
+				add=false;
+		}
+		if(runQueue.size()<60&&add){
+			runQueue.push_back(command);
+		}
+		else delete command;
+		data_mutex.unlock();
+	}
+	printf("post command %s\n",me->m_name.c_str());
+	/*if(phase == xplm_CommandBegin)
+		me->m_down_time = xtluaDefs.XTGetElapsedTime();
+	if(me->m_post_handler)
+		me->m_post_handler(me, phase, xtluaDefs.XTGetElapsedTime() - me->m_down_time, me->m_post_ref);*/
 	return 1;
 }
 std::vector<XTCmd*> get_runQueue(){
@@ -1233,7 +1313,9 @@ std::vector<XTCmd*> get_runQueue(){
 	return items;
 }
 void xtlua_localNavData(){
+	data_mutex.lock();
 	xtluaDefs.update_localNavData();//runs on xtlua thread, but lat/lon come from sim
+	data_mutex.unlock();
 }
 std::vector<string> get_runMessages(){
 	std::vector<string> items;
@@ -1250,7 +1332,9 @@ void xlua_add_callout(string callout){
 }
 void xlua_setLoadStatus(int loadStatus)
 {
+	data_mutex.lock();
 	xtluaDefs.isLoaded=loadStatus;
+	data_mutex.unlock();
 }
 bool xlua_ispaused(){
 	int retVal1=xtluaDefs.isPaused;
@@ -1258,79 +1342,109 @@ bool xlua_ispaused(){
 	return retVal1==1&&retVal2==1;
 }
 double xlua_get_simulated_time(){
-	// Main-thread time snapshot; this never queries the SDK from the worker.
-	return xtluaDefs.XTGetElapsedTime();
-}
-bool xtlua_is_sdk_dispatch_active(){
-	return xtluaDefs.isMainDispatchActive() || xlua_is_main_timer_dispatch_active();
+	//printf("get sim time\n");
+	data_mutex.lock();
+	double retVal=xtluaDefs.XTGetElapsedTime();
+	data_mutex.unlock();
+	return retVal;
 }
 int xtlua_dref_resolveDREFQueue(){
-	const int resolved = xtluaDefs.resolveQueue();
-	// Handler installation can arrive after a command was already resolved.
-	const std::vector<xtlua_cmd *> commands = xtluaDefs.XTGetHandlers();
-	for(xtlua_cmd * cmd : commands)
-	{
-		if(cmd == NULL || cmd->m_cmd == NULL)
-			continue;
-		unsigned requested = 0;
-		{
-			std::lock_guard<std::mutex> lock(data_mutex);
-			if(cmd->m_pre_handler) requested |= 1u;
-			if(cmd->m_main_handler) requested |= 2u;
-			if(cmd->m_post_handler) requested |= 4u;
+	int retVal=xtluaDefs.resolveQueue();
+	if(retVal>0){
+		std::vector<xtlua_cmd*> commandstoHandle=xtluaDefs.XTGetHandlers();
+		printf("have %d commands to handle registering\n",(int)commandstoHandle.size());
+		for(xtlua_cmd* cmd: commandstoHandle){
+			if(cmd == NULL || cmd->m_cmd == NULL)
+				continue;
+			if(cmd->m_pre_handler){
+				//printf("XPLMRegisterPreCommandHandler %s\n",cmd->m_name.c_str());
+				XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_pre_handler, 1, cmd);
+			}
+			if(cmd->m_main_handler){
+				//printf("XPLMRegisterCommandHandler %s\n",cmd->m_name.c_str());
+				XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_main_handler, 1, cmd);
+			}
+			if(cmd->m_post_handler){
+				//printf("XPLMRegisterPostCommandHandler %s\n",cmd->m_name.c_str());
+				XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_post_handler, 0, cmd);
+			}
 		}
-		unsigned& installed = registered_command_handlers[cmd];
-		const unsigned added = requested & ~installed;
-		installed |= added;
-		// No queue/worker lock can span an SDK call: it may reenter a handler.
-		if(added & 1u)
-			XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_pre_handler, 1, cmd);
-		if(added & 2u)
-			XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_main_handler, 1, cmd);
-		if(added & 4u)
-			XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_post_handler, 0, cmd);
+		retVal++;
 	}
-	return resolved + (commands.empty() ? 0 : 1);
+	return retVal;
 }
 
 
-void xtlua_dref_cleanup()
+void			xtlua_dref_cleanup()
 {
-	// Lifecycle has quiesced the worker and closed every classic Lua binding
-	// gate. Release SDK command/camera ownership while DataRef providers and
-	// their callback storage still exist, then retire the binding nodes.
-	active = false;
-	xtluaDefs.cleanup();
-
-	xtlua_dref * worker_refs;
+	active=false;//stop writing to our local drefs
+	while(s_drefs)
 	{
-		std::lock_guard<std::mutex> lock(worker_dref_list_mutex);
-		worker_refs = s_drefs;
-		s_drefs = NULL;
-	}
-	while(worker_refs)
-	{
-		xtlua_dref * next = worker_refs->m_next;
-		// Worker bindings borrow a provider handle, including our own local
-		// providers. They never own an XPLM accessor registration.
-		delete worker_refs;
-		worker_refs = next;
-	}
-	while(l_drefs)
-	{
-		xlua_dref * kill = l_drefs;
-		l_drefs = kill->m_next;
-		// Unregister only the exact handle we created, once. Looking up a
-		// provider by name here could remove a different plugin's replacement.
-		if(kill->m_ours && kill->m_dref)
+		xtlua_dref *	kill = s_drefs;
+		s_drefs = s_drefs->m_next;
+		
+		if(kill->m_dref && kill->m_ours)
+		{
+			//printf("Unregistering %s\n",kill->m_name.c_str());
+			char gBob_debstr2[128];
+			snprintf(gBob_debstr2,sizeof(gBob_debstr2),"Unregistering s_drefs %s\n",kill->m_name.c_str());
+    		XPLMDebugString(gBob_debstr2);
 			XPLMUnregisterDataAccessor(kill->m_dref);
+		} //never
+		
 		delete kill;
 	}
+	xlua_dref * pdrefs=l_drefs;
+	while(pdrefs)
 	{
-		std::lock_guard<std::mutex> lock(xlua_change_mutex);
-		changedDrefs.clear();
+		xlua_dref *	kill = pdrefs;
+		pdrefs = pdrefs->m_next;
+	
+		if(kill->m_ours)
+		{
+			if(kill->m_dref){
+				XPLMDataRef other = XPLMFindDataRef(kill->m_name.c_str());
+				if(other){//check it still exists
+					//printf("Unregistering %s\n",kill->m_name.c_str());
+					char gBob_debstr2[128];
+					snprintf(gBob_debstr2,sizeof(gBob_debstr2),"Unregistering l_drefs %s\n",kill->m_name.c_str());
+					XPLMDebugString(gBob_debstr2);
+					XPLMUnregisterDataAccessor(kill->m_dref);	
+				}
+			}
+		}
+
+	}//try the old fashioned way
+	while(l_drefs)
+	{
+		xlua_dref *	kill = l_drefs;
+		l_drefs = l_drefs->m_next;
+		
+		//if(kill->m_dref && 
+		if(kill->m_ours)
+		{
+			XPLMDataRef other = XPLMFindDataRef(kill->m_name.c_str());
+			if(other)
+				printf("Forcibly Unregistering %s\n",kill->m_name.c_str());
+			int i=0;
+			while(other&&i<4){
+				//printf("Dup Unregistering %s\n",kill->m_name.c_str());
+				char gBob_debstr2[128];
+				snprintf(gBob_debstr2,sizeof(gBob_debstr2),"Dup Unregistering l_drefs %s\n",kill->m_name.c_str());
+				XPLMDebugString(gBob_debstr2);
+				XPLMUnregisterDataAccessor(other);
+				other = XPLMFindDataRef(kill->m_name.c_str());
+				i++;
+			}
+			
+		}
+		
+		delete kill;
 	}
+	changedDrefs.clear();
 	printf("XLua Cleanup\n");
+	
+	xtluaDefs.cleanup();
 }
 
 //
@@ -1356,10 +1470,6 @@ static void resolve_cmd(xtlua_cmd * d)
 }
 xtlua_cmd * xtlua_find_cmd(const char * name)
 {
-	{
-		std::lock_guard<std::mutex> lock(data_mutex);
-		accepting_command_callbacks = true;
-	}
 	for(xtlua_cmd * i = s_cmds; i; i = i->m_next)
 	if(i->m_name == name)
 		return i;
@@ -1437,18 +1547,15 @@ xlua_cmd * xlua_create_cmd(const char * name, const char * desc)
 
 void xtlua_cmd_install_handler(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref)
 {
-	if(!cmd)
-		return;
+	if(cmd->m_main_handler != NULL)
 	{
-		std::lock_guard<std::mutex> lock(data_mutex);
-		if(cmd->m_main_handler != NULL)
-		{
-			printf("ERROR: there is already a main handler installed: %s.\n", cmd->m_name.c_str());
-			return;
-		}
-		cmd->m_main_handler = handler;
-		cmd->m_main_ref = ref;
+		printf("ERROR: there is already a main handler installed: %s.\n", cmd->m_name.c_str());
+		return;
 	}
+	cmd->m_main_handler = handler;
+	cmd->m_main_ref = ref;
+	//XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_main_handler, 1, cmd);
+	
 	xtluaDefs.XTRegisterCommandHandler(cmd);
 }
 void xlua_cmd_install_handler(xlua_cmd * cmd, xlua_cmd_handler_f handler, void * ref)
@@ -1466,50 +1573,45 @@ void xlua_cmd_install_handler(xlua_cmd * cmd, xlua_cmd_handler_f handler, void *
 
 void xtlua_cmd_install_pre_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref)
 {
-	if(!cmd)
-		return;
+	if(cmd->m_pre_handler != NULL)
 	{
-		std::lock_guard<std::mutex> lock(data_mutex);
-		if(cmd->m_pre_handler != NULL)
-		{
-			printf("ERROR: there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
-			return;
-		}
-		cmd->m_pre_handler = handler;
-		cmd->m_pre_ref = ref;
+		printf("ERROR: there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
+		return;
 	}
+	cmd->m_pre_handler = handler;
+	cmd->m_pre_ref = ref;
 	xtluaDefs.XTRegisterCommandHandler(cmd);
+	//XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_pre_handler, 1, cmd);
 }
 
 void xtlua_cmd_install_post_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref)
 {
-	if(!cmd)
-		return;
+	if(cmd->m_post_handler != NULL)
 	{
-		std::lock_guard<std::mutex> lock(data_mutex);
-		if(cmd->m_post_handler != NULL)
-		{
-			printf("ERROR: there is already a post handler installed: %s.\n", cmd->m_name.c_str());
-			return;
-		}
-		cmd->m_post_handler = handler;
-		cmd->m_post_ref = ref;
+		printf("ERROR: there is already a post handler installed: %s.\n", cmd->m_name.c_str());
+		return;	
 	}
+	cmd->m_post_handler = handler;
+	cmd->m_post_ref = ref;
 	xtluaDefs.XTRegisterCommandHandler(cmd); 
+	//XPLMRegisterCommandHandler(cmd->m_cmd, xlua_std_post_handler, 0, cmd);
 }
 
 void xtlua_cmd_start(xtlua_cmd * cmd)
 {
 	xtluaDefs.XTCommandBegin(cmd);
+	//XPLMCommandBegin(cmd->m_cmd);
 }
 void xtlua_cmd_stop(xtlua_cmd * cmd)
 {
 	xtluaDefs.XTCommandEnd(cmd);
+	//XPLMCommandEnd(cmd->m_cmd);
 }
 
 void xtlua_cmd_once(xtlua_cmd * cmd)
 {
 	xtluaDefs.XTCommandOnce(cmd);
+	//XPLMCommandOnce(cmd->m_cmd);
 }
 void xlua_cmd_start(xlua_cmd * cmd)
 {
@@ -1529,11 +1631,8 @@ void xlua_cmd_once(xlua_cmd * cmd)
 }
 void xtlua_cmd_cleanup()
 {
-	// Lifecycle caller has joined/paused the worker, including its detached
-	// callback batch. Close ingress before unregistering SDK handlers.
 	{
 		std::lock_guard<std::mutex> lock(data_mutex);
-		accepting_command_callbacks = false;
 		for(XTCmd * item : runQueue)
 			delete item;
 		runQueue.clear();
@@ -1542,12 +1641,11 @@ void xtlua_cmd_cleanup()
 	while(s_cmds)
 	{
 		xtlua_cmd * k = s_cmds;
-		const unsigned installed = registered_command_handlers[k];
-		if(k->m_cmd && (installed & 1u))
+		if(k->m_cmd && k->m_pre_handler)
 			XPLMUnregisterCommandHandler(k->m_cmd, xlua_std_pre_handler, 1, k);
-		if(k->m_cmd && (installed & 2u))
+		if(k->m_cmd && k->m_main_handler)
 			XPLMUnregisterCommandHandler(k->m_cmd, xlua_std_main_handler, 1, k);
-		if(k->m_cmd && (installed & 4u))
+		if(k->m_cmd && k->m_post_handler)
 			XPLMUnregisterCommandHandler(k->m_cmd, xlua_std_post_handler, 0, k);
 		s_cmds = s_cmds->m_next;
 		delete k;
@@ -1562,5 +1660,4 @@ void xtlua_cmd_cleanup()
 	}
 	s_cmds = NULL;
 	l_cmds = NULL;
-	registered_command_handlers.clear();
 }

@@ -11,7 +11,6 @@
 #include <XPLMDataAccess.h>
 #include <XPLMNavigation.h>
 #include "xpmtdatarefs.h"
-#include "shared_xpfuncs.h"
 #include "XPLMCamera.h"
 #include <stdio.h>
 #include <assert.h>
@@ -19,51 +18,12 @@
 #include <cmath>
 #include <limits>
 #include <utility>
-#include <iterator>
-#include <cstdlib>
-#include <cstring>
-#include <cerrno>
 #include "SerialWidget.h"
 #include "json/json.hpp"
 #include <vector>
 using nlohmann::json;
 static std::mutex data_mutex;
 typedef void (*XPLMLoadFMSFlightPlan_f)(int inDevice, const char * inBuffer, unsigned int inBufferLen);
-
-namespace {
-struct MainDispatchScope {
-    unsigned& depth;
-    bool& active;
-    MainDispatchScope(unsigned& depthIn, bool& activeIn) : depth(depthIn), active(activeIn)
-    { ++depth; active = true; }
-    ~MainDispatchScope() { active = false; --depth; }
-};
-
-std::string bridge_key(XPLMDataRef ref)
-{
-    char key[32] = {};
-    snprintf(key, sizeof(key), "%p", ref);
-    return key;
-}
-
-std::string read_string_snapshot(XPLMDataRef ref)
-{
-    const int size = XPLMGetDatab(ref, nullptr, 0, 0);
-    if(size <= 0)
-        return {};
-    std::string bytes(static_cast<size_t>(size), '\0');
-    const int copied = XPLMGetDatab(ref, &bytes[0], 0, size);
-    bytes.resize(static_cast<size_t>((std::max)(0, (std::min)(copied, size))));
-    return bytes;
-}
-
-double read_scalar_snapshot(XPLMDataRef ref, int type)
-{
-    if(type == xplmType_Double) return XPLMGetDatad(ref);
-    if(type == xplmType_Int) return XPLMGetDatai(ref);
-    return XPLMGetDataf(ref);
-}
-}
 
 static int xtlua_array_to_int(double value)
 {
@@ -78,21 +38,52 @@ static int xtlua_array_to_int(double value)
 }
 
 void XTLuaDataRefs::XTCommandBegin(xtlua_cmd * cmd){
-    if(!cmd) return;
-    std::lock_guard<std::mutex> lock(data_mutex);
-    if(acceptingRequests) commandQueue.push_back({cmd->m_name, CommandAction::begin});
+    data_mutex.lock();
+    printf("Command start %s\n",cmd->m_name.c_str());
+    XTCmd* xtcmd=new XTCmd();
+    xtcmd->xluaref=cmd;
+    xtcmd->start=true;
+    xtcmd->stop=false;
+    xtcmd->fire=false;
+    commandQueue.push_back(xtcmd);
+    data_mutex.unlock();
 }
 
 void XTLuaDataRefs::XTCommandEnd(xtlua_cmd * cmd){
-    if(!cmd) return;
-    std::lock_guard<std::mutex> lock(data_mutex);
-    if(acceptingRequests) commandQueue.push_back({cmd->m_name, CommandAction::end});
+    data_mutex.lock();
+
+    printf("Command stop %s\n",cmd->m_name.c_str());
+       
+    XTCmd* xtcmd=new XTCmd();
+    xtcmd->xluaref=cmd;
+    xtcmd->stop=true;
+    xtcmd->fire=false;
+    xtcmd->start=false;
+    commandQueue.push_back(xtcmd);
+
+    
+    data_mutex.unlock();
 }
 
 void XTLuaDataRefs::XTCommandOnce(xtlua_cmd * cmd){
-    if(!cmd) return;
-    std::lock_guard<std::mutex> lock(data_mutex);
-    if(acceptingRequests) commandQueue.push_back({cmd->m_name, CommandAction::once});
+    data_mutex.lock(); 
+    char namec[32]={0};
+    sprintf(namec,"%p",cmd);
+    std::string name=namec;
+                                     
+    //if(fireCmds.find(name)==fireCmds.end()){
+        printf("Command once %s\n",cmd->m_name.c_str());
+       
+        XTCmd* xtcmd=new XTCmd();
+        xtcmd->xluaref=cmd;
+        xtcmd->fire=true;
+        xtcmd->stop=false;
+        xtcmd->start=false;
+        commandQueue.push_back(xtcmd);
+        //fireCmds[name]=xtcmd;
+    
+  
+    data_mutex.unlock();
 }
 
 
@@ -112,45 +103,34 @@ void XTLuaDataRefs::XTRegisterCommandHandler(xtlua_cmd * cmd){
 }*/
 //begin DataRefs section
 void XTLuaDataRefs::updateStringDataRefs(){
-    if(mainDispatchDepth == 0) updateStringDataRefsImpl();
-}
-void XTLuaDataRefs::updateStringDataRefsImpl(){
-    if(updatingStrings || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingStrings);
-    struct Transfer {
-        std::string name;
-        XPLMDataRef ref;
-        std::uint64_t version;
-        bool write;
-        std::string bytes;
-    };
-    std::vector<Transfer> batch;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        for(const auto& entry : stringdataRefs) {
-            XTLuaCharArray* val = entry.second;
-            if(!val || (!val->get && !val->set)) continue;
-            batch.push_back({entry.first, val->ref, val->version, val->set,
-                             val->set ? val->value : std::string{}});
-            val->get = false; // A later worker read must survive this batch.
+    
+    for (auto x : stringdataRefs) {
+        XTLuaCharArray* val=x.second;
+        if(val->get&&!val->set){
+           
+           int size=XPLMGetDatab(val->ref,NULL,0,0);
+            //printf("getting %d is %d\n",val->ref,size);
+           if(size>0) {
+            std::vector<char> inVals(size);
+            XPLMGetDatab(val->ref,&inVals[0],0,size);
+            val->value=std::string(inVals.begin(),inVals.end());
+             //printf("got %s is %d\n",val->value.c_str(),size);
+           } else
+            val->value.clear();
+            val->get=false;
+            
         }
-    }
-    for(Transfer& item : batch) {
-        if(item.write) {
-            // xplmType_Data is an exact byte buffer. In particular, forward a
-            // zero-byte write; whether this truncates is the provider contract.
-            // Never silently append NUL bytes or overwrite a binary tail.
-            XPLMSetDatab(item.ref, const_cast<char*>(item.bytes.c_str()), 0,
-                        static_cast<int>(item.bytes.size()));
+        else if(val->set){ 
+            const char * begin = val->value.c_str();
+		    const char * end = begin + val->value.size();
+		    if(end > begin)
+		    {
+			    XPLMSetDatab(val->ref, (void *) begin, 0, (int)(end - begin));
+		    }
+            val->set=false;
+
         }
-        std::string snapshot = read_string_snapshot(item.ref);
-        std::lock_guard<std::mutex> lock(data_mutex);
-        auto found = stringdataRefs.find(item.name);
-        if(found == stringdataRefs.end()) continue;
-        XTLuaCharArray* val = found->second;
-        if(val->ref != item.ref || val->version != item.version) continue;
-        if(item.write) val->set = false;
-        if(!val->set) val->value = std::move(snapshot);
+        
     }
 }
 float scale(XTControlObject* c){
@@ -170,103 +150,68 @@ float scale(XTControlObject* c){
 
 }
 void XTLuaDataRefs::updateCommands(){
-    if(mainDispatchDepth == 0) updateCommandsImpl();
-}
-void XTLuaDataRefs::updateCommandsImpl(){
-    if(updatingCommands || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingCommands);
-    std::deque<CommandRequest> batch;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        batch.swap(commandQueue);
-    }
-    std::deque<CommandRequest> pending;
-    std::unordered_set<std::string> blockedNames;
-    while(!batch.empty()) {
-        CommandRequest request=std::move(batch.front());
-        batch.pop_front();
-        if(blockedNames.find(request.name) != blockedNames.end()) {
-            pending.push_back(std::move(request));
+    //externally locked
+    for(XTCmd* c:commandQueue){
+        xtlua_cmd* cmd=c->xluaref;
+        if(cmd == nullptr || cmd->m_cmd == nullptr){
+            delete c;
             continue;
         }
-        const XPLMCommandRef command = XPLMFindCommand(request.name.c_str());
-        if(!command) {
-            // Preserve FIFO for this command, while allowing an unrelated
-            // held command to receive its End. No unresolved phase is dropped.
-            blockedNames.insert(request.name);
-            if(unresolvedCommands.insert(request.name).second)
-                xtlua_queue_log("XTLua: waiting for command " + request.name + "\n");
-            pending.push_back(std::move(request));
-            continue;
+        if(c->fire){
+            printf("Do Command once %s %p\n",cmd->m_name.c_str(),cmd->m_cmd);
+            XPLMCommandOnce(cmd->m_cmd);
+        
         }
-        unresolvedCommands.erase(request.name);
-        switch(request.action) {
-        case CommandAction::begin:
-            XPLMCommandBegin(command);
-            ++heldCommands[command];
-            break;
-        case CommandAction::end: {
-            auto held=heldCommands.find(command);
-            if(held != heldCommands.end()) {
-                XPLMCommandEnd(command);
-                if(--held->second == 0) heldCommands.erase(held);
-            } else {
-                xtlua_queue_log("XTLua: ignored unmatched command end: " + request.name + "\n");
-            }
-            break;
+        if(c->start){
+            printf("Do Command Begin %s %p\n",cmd->m_name.c_str(),cmd->m_cmd);
+            XPLMCommandBegin(cmd->m_cmd);
         }
-        case CommandAction::once: XPLMCommandOnce(command); break;
+        if(c->stop){
+            printf("Do Command End %s %p\n",cmd->m_name.c_str(),cmd->m_cmd);
+            XPLMCommandEnd(cmd->m_cmd);
         }
+        delete c;
     }
-    if(!pending.empty()) {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        pending.insert(pending.end(), std::make_move_iterator(commandQueue.begin()),
-                       std::make_move_iterator(commandQueue.end()));
-        commandQueue.swap(pending);
-    }
-    // Overrides are created and consumed exclusively by the main thread.
+    commandQueue.clear();
     std::unordered_map<XPLMDataRef,float> newValues;
     for(XTControlObject* c:controlOverrides){
-      try {
          
-         if(c->srcDref==NULL || c->dstDref==NULL){ // Retry unresolved bindings.
-            XTControlObject candidate=*c;
-            printf("Do Create Override %s\n",candidate.data.c_str());
-            json jData =json::parse(candidate.data);
+         if(c->srcDref==NULL){ //needs init
+            printf("Do Create Override %s\n",c->data.c_str());
+            json jData =json::parse(c->data);
             printf("Find src %s\n",jData["srcDref"].get<std::string>().c_str());
-            candidate.srcDref=XPLMFindDataRef(jData["srcDref"].get<std::string>().c_str());
+            c->srcDref=XPLMFindDataRef(jData["srcDref"].get<std::string>().c_str());
             printf("Find dst %s\n",jData["dstDref"].get<std::string>().c_str());
-            candidate.dstDref=XPLMFindDataRef(jData["dstDref"].get<std::string>().c_str());
-            candidate.dstIndex=-1;
-            if(candidate.dstDref)
+            c->dstDref=XPLMFindDataRef(jData["dstDref"].get<std::string>().c_str());
+            c->dstIndex=-1;
+            if(c->dstDref)
 			{
-				XPLMDataTypeID tid = XPLMGetDataRefTypes(candidate.dstDref);
+				XPLMDataTypeID tid = XPLMGetDataRefTypes(c->dstDref);
                 if(tid & (xplmType_FloatArray | xplmType_IntArray))			// AND are array type
 				{
-                   candidate.dstIndex =jData["dstIndex"].get<int>();
+                   c->dstIndex =jData["dstIndex"].get<int>();
                 }
             }
             if(jData.contains("scale"))
-                candidate.scale=jData["scale"].get<float>();
+                c->scale=jData["scale"].get<float>();
             else
-                candidate.scale=1.0;
+                c->scale=1.0;
             if(jData.contains("scaledref"))
             {
-                 candidate.scaleDref=XPLMFindDataRef(jData["scaledref"].get<std::string>().c_str());
+                 c->scaleDref=XPLMFindDataRef(jData["scaledref"].get<std::string>().c_str());
             } 
             if(jData.contains("min"))
             {
-                candidate.min=jData["min"].get<float>();
+                c->min=jData["min"].get<float>();
             }
             if(jData.contains("max"))
             {
-                candidate.max=jData["max"].get<float>();
+                c->max=jData["max"].get<float>();
             }
-            candidate.minin=jData["minin"].get<float>();
-            candidate.maxin=jData["maxin"].get<float>();
-            candidate.minout=jData["minout"].get<float>();
-            candidate.maxout=jData["maxout"].get<float>();
-            *c=std::move(candidate);
+            c->minin=jData["minin"].get<float>();
+            c->maxin=jData["maxin"].get<float>();
+            c->minout=jData["minout"].get<float>();
+            c->maxout=jData["maxout"].get<float>();
          }
          
          if(c->srcDref!=NULL && c->dstDref!=NULL){
@@ -303,9 +248,6 @@ void XTLuaDataRefs::updateCommandsImpl(){
          }
          else
             printf("Cant Override %s\n",c->data.c_str());
-      } catch(const std::exception& error) {
-          printf("XTLua: invalid control override: %s\n", error.what());
-      }
     }
     for (auto x : newValues) {
         XPLMDataRef c=x.first;
@@ -318,18 +260,37 @@ void XTLuaDataRefs::updateCommandsImpl(){
     }
    // fireCmds.clear();
 }
-void XTLuaDataRefs::updateNavDataRefs(){
-    if(mainDispatchDepth == 0) updateNavDataRefsImpl();
+void XTLuaDataRefs::addNavData(int    id,
+        int    type,
+        float  latitude,
+        float  longitude, 
+        int    frequency,
+        float  heading,
+        char * name,char * ident){
+
+        NavAid* navaid=new NavAid(); 
+        navaid->id=id;
+        navaid->type=type;
+        navaid->latitude=latitude;
+        navaid->longitude=longitude;
+        navaid->frequency=frequency;
+        navaid->heading=heading;
+        navaid->name=std::string(name);
+         navaid->ident=std::string(ident);
+        navaid->next=NULL;
+        if(lastnavaid==NULL)
+            navaids=navaid;
+        else 
+            lastnavaid->next=navaid;
+        lastnavaid=navaid;
 }
-void XTLuaDataRefs::updateNavDataRefsImpl(){
-    if(updatingNav || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingNav);
+void XTLuaDataRefs::updateNavDataRefs(){
     int entries=XPLMCountFMSEntries();
     int currentIndex=XPLMGetDestinationFMSEntry();
     int currentView=XPLMGetDisplayedFMSEntry();
     json dVdata = json::array();
     dVdata[0]=currentView+1;
-    const std::string displayedEntry=dVdata.dump();
+    currentDisplayedEntry=dVdata.dump();
    // printf("currentView XPLMGetDisplayedFMSEntry=%d\n",currentView);
     json nVdata =json::array();
     float lastoutLat=0.0f;
@@ -338,12 +299,12 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
     bool hasLastOutput=false;
     int count=0;
     for(int i=0;i<entries;i++){
-          XPLMNavType         outType=0;
-          char                outID[256]={0};
+          XPLMNavType         outType;
+          char                outID[32]={0}; 
           XPLMNavRef          outRef=XPLM_NAV_NOT_FOUND;
-          int                 outAltitude=0;
-          float               outLat=(std::numeric_limits<float>::quiet_NaN)();
-          float               outLon=(std::numeric_limits<float>::quiet_NaN)();
+          int                 outAltitude;
+          float               outLat;
+          float               outLon;
           XPLMGetFMSEntryInfo(i,&outType,outID,&outRef,&outAltitude,&outLat,&outLon); 
           if(outRef!=XPLM_NAV_NOT_FOUND){
               XPLMNavType         outType2;   
@@ -404,15 +365,9 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
     
     
     
-    std::string fmsSnapshot=nVdata.dump();
-    bool loadNavaids=false;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        loadNavaids = navaids == nullptr;
-    }
-    NavAid* loadedHead=nullptr;
-    NavAid* loadedTail=nullptr;
-    if(loadNavaids){
+    incomingFMSString=nVdata.dump();
+    
+    if(navaids==NULL){
         XPLMNavRef nAid=XPLMGetFirstNavAid();
         latR = XPLMFindDataRef("sim/flightmodel/position/latitude");
         lonR = XPLMFindDataRef("sim/flightmodel/position/longitude");
@@ -423,55 +378,29 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
                 float               outHeight;    /* Can be NULL */
                 int                 outFrequency=0;    /* Can be NULL */
                 float               outHeading=0;    /* Can be NULL */
-                char                outID[32]={};    /* Can be NULL */
-                char                outName[256]={};    /* Can be NULL */
-                char                outReg[1]={};
+                char                outID[32];    /* Can be NULL */
+                char                outName[256];    /* Can be NULL */
+                char                outReg[1];
                 XPLMGetNavAidInfo(nAid,&outType,&outLatitude,&outLongitude,&outHeight,&outFrequency,&outHeading,outID,outName,outReg);
                 /*double latDif=outLatitude-lat;
                 double lonDif=outLongitude-lon;
                 if(outType!=512&&latDif<2&&latDif>-2&&lonDif<2&&lonDif>-2)
                 //if(outType!=512)
                     printf("%d=%d,%d,%f,%f,%f,%s\n",nAid,outType,outFrequency,latDif,lonDif,outHeading,outName); */
-                if(outType!=512) {
-                    NavAid* item=new NavAid{nAid, outType, outLatitude, outLongitude,
-                                           outFrequency, outHeading, outName, outID, nullptr};
-                    if(loadedTail) loadedTail->next=item;
-                    else loadedHead=item;
-                    loadedTail=item;
-                }
+                if(outType!=512)
+                    addNavData(nAid,outType,outLatitude,outLongitude,outFrequency,outHeading,outName,outID);
                 nAid=XPLMGetNextNavAid(nAid); 
             }
     }
-    const double latitude=latR ? XPLMGetDatad(latR) : 0.0;
-    const double longitude=lonR ? XPLMGetDatad(lonR) : 0.0;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        incomingFMSString=std::move(fmsSnapshot);
-        currentDisplayedEntry=displayedEntry;
-        lat=latitude;
-        lon=longitude;
-        if(loadNavaids) {
-            navaids=loadedHead;
-            lastnavaid=loadedTail;
-        }
-    }
+    lat=XPLMGetDatad(latR);
+    lon=XPLMGetDatad(lonR);
 }
 bool firstPass=true;
 void XTLuaDataRefs::update_localNavData(){
-    // Only this worker owns the incremental search. The main thread publishes
-    // an immutable nav list and position snapshot; cleanup pauses the worker.
-    double lat;
-    double lon;
-    NavAid* navSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        if(skipNaviads) return;
-        lat=this->lat;
-        lon=this->lon;
-        navSnapshot=navaids;
-    }
+    if(skipNaviads)
+        return;
     if(current_navaid==NULL){
-        current_navaid=navSnapshot;
+        current_navaid=navaids;
          if(localNavaids.size()>0){
             std::vector<int> left;
             int count=0;
@@ -499,11 +428,7 @@ void XTLuaDataRefs::update_localNavData(){
             }
             
 
-            {
-                std::string snapshot=nVdata.dump();
-                std::lock_guard<std::mutex> lock(data_mutex);
-                incomingNavaidString=std::move(snapshot);
-            }
+                incomingNavaidString=nVdata.dump();//printf("erasing %d\n",left.size());
             for (int id:left)
                 localNavaids.erase(id);
             }
@@ -537,10 +462,7 @@ void XTLuaDataRefs::update_localNavData(){
         if(localNavaids.size()>0){
             lastUpdatelat=lat;
             lastUpdatelon=lon;
-            {
-                std::lock_guard<std::mutex> lock(data_mutex);
-                skipNaviads=true;
-            }
+            skipNaviads=true;
             firstPass=false;
             //printf("completed pass\n");
         }
@@ -709,166 +631,231 @@ void XTLuaDataRefs::updateArrayDataRef(const std::string& name)
 }
 
 void XTLuaDataRefs::updateFloatDataRefs(){
-    if(mainDispatchDepth == 0) updateFloatDataRefsImpl();
-}
-void XTLuaDataRefs::updateFloatDataRefsImpl(){
-    if(updatingFloats || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingFloats);
-    struct Transfer {
-        std::string name;
-        XPLMDataRef ref;
-        int type;
-        std::uint64_t version;
-        bool write;
-        double value;
-    };
-    std::vector<Transfer> batch;
+    // Scalar DataRefs retain the existing synchronized path. Arrays are
+    // snapshotted and flushed separately without holding data_mutex for SDK I/O.
+    const bool allGet = ((simTime - beginFlightTime) < 10);
+    auto changedList = changeddataRefs;
+    changeddataRefs.clear();
+    if(allGet)
+        changedList = floatdataRefs;
+    for(const auto& entry : changedList)
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        const bool allGet = ((simTime - beginFlightTime) < 10);
-        for(const auto& entry : floatdataRefs) {
-            if(arrayDataRefs.find(entry.first) != arrayDataRefs.end() || entry.second.empty())
-                continue;
-            XTLuaArrayFloat* val=entry.second[0];
-            if(!allGet && !val->get && !val->set) continue;
-            batch.push_back({entry.first, val->ref, val->type, val->version, val->set, val->value});
-            val->get=false;
+        const std::string& name = entry.first;
+        if(arrayDataRefs.find(name) != arrayDataRefs.end())
+            continue;
+        auto found = floatdataRefs.find(name);
+        if(found == floatdataRefs.end() || found->second.empty())
+            continue;
+        XTLuaArrayFloat* val = found->second[0];
+        if((val->get || allGet) && !val->set)
+        {
+            double fresh = XPLMGetDataf(val->ref);
+            if(val->type == xplmType_Double)
+                fresh = XPLMGetDatad(val->ref);
+            else if(val->type == xplmType_Int)
+                fresh = XPLMGetDatai(val->ref);
+            val->get = false;
+            val->value = static_cast<float>(fresh);
         }
-        changeddataRefs.clear();
-    }
-    for(const Transfer& item : batch) {
-        if(item.write) {
-            if(item.type == xplmType_Double) XPLMSetDatad(item.ref, item.value);
-            else if(item.type == xplmType_Int) XPLMSetDatai(item.ref, xtlua_array_to_int(item.value));
-            else XPLMSetDataf(item.ref, static_cast<float>(item.value));
+        else if(val->set)
+        {
+            const float value = static_cast<float>(val->value);
+            if(val->type == xplmType_Double)
+                XPLMSetDatad(val->ref, value);
+            else if(val->type == xplmType_Float)
+                XPLMSetDataf(val->ref, value);
+            else if(val->type == xplmType_Int)
+                XPLMSetDatai(val->ref, static_cast<int>(std::lround(value)));
+            val->set = false;
         }
-        const double snapshot=read_scalar_snapshot(item.ref, item.type);
-        std::lock_guard<std::mutex> lock(data_mutex);
-        auto found=floatdataRefs.find(item.name);
-        if(found == floatdataRefs.end() || found->second.empty()) continue;
-        XTLuaArrayFloat* val=found->second[0];
-        if(val->ref != item.ref || val->type != item.type || val->version != item.version)
-            continue; // A newer worker write owns this cache entry now.
-        if(item.write) val->set=false;
-        if(!val->set) val->value=snapshot;
     }
 }
 
 double XTLuaDataRefs::XTGetElapsedTime(){
-    return timeT.load(std::memory_order_acquire);
-}
+    //data_mutex.lock();
+    double retVal=timeT;
+    //data_mutex.unlock();
+    return retVal;
 
+}
 void XTLuaDataRefs::refreshAllDataRefs(){
-    if(mainDispatchDepth != 0 || refreshingDataRefs || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, refreshingDataRefs);
+    struct StringRefresh {
+        std::string name;
+        XPLMDataRef ref;
+        std::string before;
+        std::string after;
+    };
+    struct ScalarRefresh {
+        std::string name;
+        XPLMDataRef ref;
+        int type;
+        double before;
+        double after;
+    };
+    std::vector<StringRefresh> strings;
+    std::vector<ScalarRefresh> scalars;
     std::vector<std::string> arrayNames;
     {
         std::lock_guard<std::mutex> lock(data_mutex);
         for(const auto& entry : stringdataRefs)
-            if(entry.second) entry.second->get=true;
-        for(const auto& entry : floatdataRefs) {
-            if(arrayDataRefs.find(entry.first) != arrayDataRefs.end()) {
-                arrayNames.push_back(entry.first);
-            } else if(!entry.second.empty()) {
-                entry.second[0]->get=true;
+        {
+            const XTLuaCharArray* val = entry.second;
+            if(val != nullptr && !val->set)
+                strings.push_back({entry.first, val->ref, val->value, {}});
+        }
+        for(const auto& entry : floatdataRefs)
+        {
+            const std::string& name = entry.first;
+            if(arrayDataRefs.find(name) != arrayDataRefs.end())
+            {
+                arrayNames.push_back(name);
+                continue;
+            }
+            if(entry.second.empty())
+                continue;
+            XTLuaArrayFloat* val = entry.second[0];
+            if(val->set)
+                continue; // Preserve a worker write queued before aircraft refresh.
+            scalars.push_back({name, static_cast<XPLMDataRef>(val->ref),
+                               val->type, val->value, 0.0});
+        }
+    }
+    // Accessor callbacks may run arbitrary provider code. Never invoke them
+    // while holding the worker cache lock.
+    for(StringRefresh& item : strings)
+    {
+        const int size = XPLMGetDatab(item.ref, NULL, 0, 0);
+        if(size > 0)
+        {
+            std::vector<char> bytes(static_cast<size_t>(size));
+            const int copied = XPLMGetDatab(item.ref, bytes.data(), 0, size);
+            item.after.assign(bytes.data(),
+                              static_cast<size_t>((std::max)(0, (std::min)(copied, size))));
+        }
+    }
+    for(ScalarRefresh& item : scalars)
+    {
+        if(item.type == xplmType_Double)
+            item.after = XPLMGetDatad(item.ref);
+        else if(item.type == xplmType_Int)
+            item.after = XPLMGetDatai(item.ref);
+        else
+            item.after = XPLMGetDataf(item.ref);
+    }
+    {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        for(const StringRefresh& item : strings)
+        {
+            auto found = stringdataRefs.find(item.name);
+            if(found == stringdataRefs.end() || found->second == nullptr)
+                continue;
+            XTLuaCharArray* val = found->second;
+            if(val->ref == item.ref && !val->set && val->value == item.before)
+            {
+                val->value = item.after;
+                val->get = false;
+            }
+        }
+        for(const ScalarRefresh& item : scalars)
+        {
+            auto found = floatdataRefs.find(item.name);
+            if(found == floatdataRefs.end() || found->second.empty())
+                continue;
+            XTLuaArrayFloat* val = found->second[0];
+            if(val->ref == item.ref && val->type == item.type &&
+               !val->set && val->value == item.before)
+            {
+                val->value = static_cast<float>(item.after);
+                val->get = false;
             }
         }
     }
-    // Use the same versioned transfers for refresh and the regular flightloop.
-    updateStringDataRefsImpl();
-    updateFloatDataRefsImpl();
     for(const std::string& name : arrayNames)
         updateArrayDataRef(name);
 }
-
 void XTLuaDataRefs::updateDataRefs(){
-    if(mainDispatchDepth != 0 || updatingDataRefs || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingDataRefs);
-    isPaused=paused_ref ? XPLMGetDatai(paused_ref) : 1;
-    simTime=sim_time_ref ? XPLMGetDataf(sim_time_ref) : 0.0;
-    timeT.store(simTime, std::memory_order_release);
-    const bool replay=replay_ref && XPLMGetDatai(replay_ref) != 0;
-
-    // Side effects enqueued by the worker are consumed from an owned batch.
-    updateMainThreadRequests();
-    if(updateRoll == 0 && !replay)
-        updateNavDataRefsImpl();
-    if(updateRoll == 5) {
-        updateStringDataRefsImpl();
-        updateRoll=-1;
-    }
-    updateFloatDataRefsImpl();
-    updateCommandsImpl();
-    ++updateRoll;
-    serialWindow.show();
     std::vector<std::string> activeArrayNames;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
+    data_mutex.lock();
+    //printf("updateDataRefs\n");
+        //timeT = XPLMGetElapsedTime();
+        isPaused=XPLMGetDatai(paused_ref);
+        simTime=XPLMGetDataf(sim_time_ref);
+        //printf("time now %f %f\n",timeT,simTime);
+        timeT = simTime;
+        if(updateRoll==0&&(XPLMGetDatai(replay_ref) == 0))
+        {
+            updateNavDataRefs();
+            
+        }
+        else if(updateRoll==5)
+        {
+            updateStringDataRefs();
+            updateRoll=-1;//will go back to 0 next line
+        }
+        //else if(updateRoll==2)
+        {
+            updateFloatDataRefs();
+            updateCommands(); //always do command queue
+            
+        } 
+        updateRoll++;
+        serialWindow.show();
         for(const auto& array : arrayDataRefs)
-            if(array.second.active) activeArrayNames.push_back(array.first);
-    }
+            if(array.second.active)
+                activeArrayNames.push_back(array.first);
+    data_mutex.unlock();
     for(const std::string& name : activeArrayNames)
         updateArrayDataRef(name);
 }
-
 void XTLuaDataRefs::cleanup(){
-    assert(mainDispatchDepth == 0);
-    if(mainDispatchDepth != 0 || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, cleaning);
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        acceptingRequests=false;
-        commandQueue.clear();
-        mainThreadQueue.clear();
-    }
-    // SDK End callbacks can reenter the plugin. No worker/cache lock is held;
-    // lifecycle work is deferred while this dispatch guard is active.
-    auto held=std::move(heldCommands);
-    heldCommands.clear();
-    unresolvedCommands.clear();
-    for(const auto& entry : held)
-        for(unsigned i=0; i<entry.second; ++i) XPLMCommandEnd(entry.first);
-    // Camera state is main-owned and released before caches are destroyed.
-    extern bool controllingCam;
-    extern int wantsCamera;
-    wantsCamera=0;
-    if(controllingCam) XPLMDontControlCamera();
-    controllingCam=false;
-    std::lock_guard<std::mutex> lock(data_mutex);
+    data_mutex.lock();
     drefResolveQueue.clear();
     cmdResolveQueue.clear();
     cmdHandlerResolveQueue.clear();
-    for(const auto& entry : floatdataRefs)
-        for(XTLuaArrayFloat* item : entry.second) delete item;
-    floatdataRefs.clear();
-    arrayDataRefs.clear();
-    deferredArrayWrites.clear();
-    for(const auto& entry : stringdataRefs) delete entry.second;
-    stringdataRefs.clear();
-    while(navaids) {
-        NavAid* next=navaids->next;
-        delete navaids;
-        navaids=next;
-    }
-    for(XTControlObject* item : controlOverrides) delete item;
-    controlOverrides.clear();
-    lastnavaid=nullptr;
-    current_navaid=nullptr;
-    latR=nullptr;
-    lonR=nullptr;
-    lat=lon=lastUpdatelat=lastUpdatelon=0.0;
-    skipNaviads=true;
-    firstPass=true;
-    changeddataRefs.clear();
-    localNavaids.clear();
-    incomingNavaidString.clear();
-    localNavaidString.clear();
-    incomingFMSString.clear();
-    localFMSString.clear();
-    currentDisplayedEntry.clear();
-    updateRoll=0;
-    acceptingRequests=true;
+     for(XTCmd* command:commandQueue){
+        delete command;
+     }
+     commandQueue.clear();
+     for (auto x : floatdataRefs) {
+        //int i=0;
+        string name=x.first;
+        std::vector<XTLuaArrayFloat*> val=floatdataRefs[name];
+        for(XTLuaArrayFloat* k:val){
+            delete k;
+        }
+     }
+     floatdataRefs.clear();
+     arrayDataRefs.clear();
+     deferredArrayWrites.clear();
+     for (auto x : stringdataRefs) {
+       // int i=0;
+        string name=x.first;
+        XTLuaCharArray* val=stringdataRefs[name];
+        delete val;
+        
+     }
+     stringdataRefs.clear();
+     NavAid* cNav=navaids;
+     while(cNav!=NULL){
+         navaids=navaids->next;
+         delete cNav;
+         cNav=navaids;
+     }
+     for(XTControlObject* c:controlOverrides){
+         delete c;
+     }
+
+     navaids=NULL;
+     lastnavaid=NULL;
+     current_navaid=NULL;
+     changeddataRefs.clear();
+     localNavaids.clear();
+     controlOverrides.clear();
+     updateRoll=0;
+     printf("XTLua:Cleaned up data\n");
+    data_mutex.unlock();
 }
+
 
 void XTLuaDataRefs::XTqueueresolve_dref(xtlua_dref * d){
     data_mutex.lock();
@@ -886,156 +873,202 @@ void XTLuaDataRefs::XTqueueresolve_cmd(xtlua_cmd * d){
 
 
 int XTLuaDataRefs::resolveQueue(){
-    if(mainDispatchDepth != 0 || resolving || cleaning) return 0;
-    MainDispatchScope dispatch(mainDispatchDepth, resolving);
-    if(!paused_ref) paused_ref=XPLMFindDataRef("sim/time/paused");
-    if(!replay_ref) replay_ref=XPLMFindDataRef("sim/time/is_in_replay");
-    if(!sim_time_ref) {
-        sim_time_ref=XPLMFindDataRef("sim/time/total_running_time_sec");
-        if(sim_time_ref) beginFlightTime=XPLMGetDataf(sim_time_ref);
+    int retVal=0;
+    data_mutex.lock();
+    if(paused_ref==NULL)
+        paused_ref=XPLMFindDataRef("sim/time/paused");
+    if(replay_ref==NULL)
+        replay_ref=XPLMFindDataRef("sim/time/is_in_replay");    
+    if(sim_time_ref==NULL){
+        sim_time_ref = XPLMFindDataRef("sim/time/total_running_time_sec");  
+        beginFlightTime=XPLMGetDataf(sim_time_ref);
     }
-    std::vector<xtlua_dref*> datarefs;
-    std::vector<xtlua_cmd*> commands;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        datarefs.swap(drefResolveQueue);
-        commands.swap(cmdResolveQueue);
-    }
-    int resolvedCount=0;
-    std::vector<xtlua_dref*> pendingDatarefs;
-    std::vector<xtlua_cmd*> pendingCommands;
-    for(xtlua_dref* d : datarefs) {
-        if(!d || d->m_resolved.load(std::memory_order_acquire)) continue;
-        if(d->m_name.rfind("xtlua/", 0) == 0) {
-            d->m_types=xplmType_Data;
-            d->m_resolved.store(true, std::memory_order_release);
-            ++resolvedCount;
+    //printf("XTLua:Resolving queue\n");
+    for(xtlua_dref * d:drefResolveQueue){
+        //printf("Resolving dref %s\n",d->m_name.c_str());
+        if(d->m_name.rfind("xtlua/", 0) == 0){
+            d->m_types =xplmType_Data;
             continue;
         }
-        // Metadata is private to the resolver until m_resolved is published.
-        d->m_ours=0;
-        d->local_dref=nullptr;
-        d->m_index=-1;
-        d->m_types=0;
+        assert(d->m_dref == NULL);
+        assert(d->m_types == 0);
+        assert(d->m_index == -1);
+        assert(d->m_ours == 0);
         grabLocal(d);
-        XPLMDataRef ref=XPLMFindDataRef(d->m_name.c_str());
-        int index=-1;
-        int types=ref ? XPLMGetDataRefTypes(ref) : 0;
-        if(!ref) {
-            const auto open=d->m_name.find('[');
-            const auto close=d->m_name.find(']');
-            if(open != std::string::npos && open > 0 && close != std::string::npos &&
-               close > open+1 && close == d->m_name.size()-1) {
-                const std::string number=d->m_name.substr(open+1, close-open-1);
-                char* end=nullptr;
-                errno=0;
-                const long candidate=std::strtol(number.c_str(), &end, 10);
-                if(errno != ERANGE && end != number.c_str() && *end == '\0' && candidate >= 0 &&
-                   candidate <= (std::numeric_limits<int>::max)()) {
-                    ref=XPLMFindDataRef(d->m_name.substr(0, open).c_str());
-                    types=ref ? XPLMGetDataRefTypes(ref) : 0;
-                    if(types & (xplmType_FloatArray | xplmType_IntArray))
-                        index=static_cast<int>(candidate);
-                    else ref=nullptr;
-                }
-            }
-        }
-        if(!ref || !types) {
-            pendingDatarefs.push_back(d);
+        /*if(d->m_ours){
+            printf("Resolved local dref %s\n",d->m_name.c_str());
             continue;
-        }
-        d->m_dref=ref;
-        d->m_types=types;
-        d->m_index=index;
-        const std::string name=bridge_key(ref);
-        bool exists=false;
+        }*/
+       // if(!d->m_ours)
+        //    printf("Not local dref %s\n",d->m_name.c_str());
+        d->m_dref = XPLMFindDataRef(d->m_name.c_str());
+        //initialise our datasets
+        if(d->m_dref)
         {
-            std::lock_guard<std::mutex> lock(data_mutex);
-            exists=floatdataRefs.find(name) != floatdataRefs.end() ||
-                   stringdataRefs.find(name) != stringdataRefs.end();
+            d->m_index = -1;
+            d->m_types = XPLMGetDataRefTypes(d->m_dref);
+            // Multiple worker modules may bind the same SDK DataRef. Reuse one
+            // snapshot; appending a second array would double its visible length.
+            char existingName[32] = {0};
+            sprintf(existingName, "%p", d->m_dref);
+            if(floatdataRefs.find(existingName) != floatdataRefs.end() ||
+               stringdataRefs.find(existingName) != stringdataRefs.end())
+            {
+                retVal++;
+                continue;
+            }
+            //printf("Resolved dref %s to %p as %d\n",d->m_name.c_str(),d->m_dref,d->m_types);
+            if(d->m_types & (xplmType_FloatArray | xplmType_IntArray))			// an array type
+            {
+                char namec[32];
+                sprintf(namec,"%p",d->m_dref);
+                std::string name=namec;
+
+                int size=0;
+                int type=xplmType_FloatArray;
+                if(!(d->m_types & xplmType_FloatArray)){
+                    type=xplmType_IntArray;
+                    
+                    size=XPLMGetDatavi(d->m_dref,NULL,0,0);
+                    //printf("Resolved int array dref %s to %p with %d\n",d->m_name.c_str(),d->m_dref,size);
+                }
+                else{
+                    
+                    size=XPLMGetDatavf(d->m_dref,NULL,0,0);
+                    //printf("Resolved float array dref %s to %p with %d\n",d->m_name.c_str(),d->m_dref,size);
+                }
+                if(size < 0)
+                    size = 0;
+                
+                std::vector<float> inVals(static_cast<size_t>(size));
+                std::vector<int> inIVals(static_cast<size_t>(size));
+                if(size > 0)
+                {
+                    const int copied = !(d->m_types & xplmType_FloatArray)
+                        ? XPLMGetDatavi(d->m_dref, inIVals.data(), 0, size)
+                        : XPLMGetDatavf(d->m_dref, inVals.data(), 0, size);
+                    // A provider may resize between the length query and read.
+                    // Publish only elements actually returned by the SDK.
+                    size = (std::max)(0, (std::min)(copied, size));
+                }
+
+                // Even a zero-length SDK array needs a bridge entry.
+                floatdataRefs.emplace(name, std::vector<XTLuaArrayFloat*>{});
+                arrayDataRefs[name] = {d->m_dref, type, false};
+                
+                for(int i=0;i<size;i++){
+                    XTLuaArrayFloat* v=new XTLuaArrayFloat;
+                    if(!(d->m_types & xplmType_FloatArray))
+                        v->value= inIVals[i];
+                    else
+                        v->value=inVals[i];
+                   // printf("defaulted array dref %s to %f with %d\n",d->m_name.c_str(),v->value,size);  
+                    v->ref=d->m_dref;
+                    v->type=type;
+                    v->get=true;
+                    v->index=i;
+                    //printf("%d=%f\n",i,inVals[i]);
+                    //newval.values.push_back(v);
+                    floatdataRefs[name].push_back(v);
+                }
+                //floatdataRefs[name]=newval;
+            }
+            else if(d->m_types & xplmType_Float || d->m_types & xplmType_Double || d->m_types & xplmType_Int){
+                char namec[32];
+                sprintf(namec,"%p",d->m_dref);
+                std::string name=namec;
+                float val=0.0;
+                XTLuaArrayFloat* v=new XTLuaArrayFloat;
+                if(d->m_types & xplmType_Double){
+                    val= static_cast<float>(XPLMGetDatad(d->m_dref));
+                    v->type=xplmType_Double;
+                }
+                else if(d->m_types & xplmType_Float){
+                    val=XPLMGetDataf(d->m_dref);
+                    v->type=xplmType_Float;
+                }
+                else if(d->m_types & xplmType_Int){
+                    val= static_cast<float>(XPLMGetDatai(d->m_dref));
+                    v->type=xplmType_Int;
+                }
+                v->get=true;
+                v->value=val;
+                v->ref=d->m_dref;
+                //newval.values.push_back(v);
+                //printf(" =%f\n",val);
+                floatdataRefs[name].push_back(v);
+
+            }else if(d->m_types & xplmType_Data){
+                //its a string!
+                char namec[32];
+                sprintf(namec,"%p",d->m_dref);
+                std::string name=namec;
+                XTLuaCharArray* v=new XTLuaCharArray;
+                v->get=true;
+                v->value="";
+                v->ref=d->m_dref;
+                stringdataRefs[name]=v;
+            }
+            retVal++;
         }
-        if(!exists) {
-            std::vector<XTLuaArrayFloat*> initialNumbers;
-            XTLuaCharArray* initialString=nullptr;
-            int arrayType=0;
-            if(types & (xplmType_FloatArray | xplmType_IntArray)) {
-                arrayType=(types & xplmType_FloatArray) ? xplmType_FloatArray : xplmType_IntArray;
-                int size=arrayType == xplmType_FloatArray
-                    ? XPLMGetDatavf(ref, nullptr, 0, 0) : XPLMGetDatavi(ref, nullptr, 0, 0);
-                size=(std::max)(0, size);
-                std::vector<double> snapshot(static_cast<size_t>(size));
-                if(size > 0) {
-                    int copied=0;
-                    if(arrayType == xplmType_FloatArray) {
-                        std::vector<float> values(static_cast<size_t>(size));
-                        copied=XPLMGetDatavf(ref, values.data(), 0, size);
-                        size=(std::max)(0, (std::min)(size, copied));
-                        for(int i=0; i<size; ++i) snapshot[i]=values[i];
-                    } else {
-                        std::vector<int> values(static_cast<size_t>(size));
-                        copied=XPLMGetDatavi(ref, values.data(), 0, size);
-                        size=(std::max)(0, (std::min)(size, copied));
-                        for(int i=0; i<size; ++i) snapshot[i]=values[i];
+        else
+        {
+            std::string::size_type obrace = d->m_name.find('[');
+            std::string::size_type cbrace = d->m_name.find(']');
+            if(obrace != d->m_name.npos && cbrace != d->m_name.npos)			// Gotta have found the braces
+            if(obrace > 0)														// dref name can't be empty
+            if(cbrace > obrace)													// braces must be in-order - avoids unsigned math insanity
+            if((cbrace - obrace) > 1)											// Gotta have SOMETHING in between the braces
+            {
+                std::string number = d->m_name.substr(obrace+1,cbrace - obrace - 1);
+                std::string refname = d->m_name.substr(0,obrace);
+                
+                XPLMDataRef arr = XPLMFindDataRef(refname.c_str());				// Only if we have a valid name
+                if(arr)
+                {
+                    XPLMDataTypeID tid = XPLMGetDataRefTypes(arr);
+                    if(tid & (xplmType_FloatArray | xplmType_IntArray))			// AND are array type
+                    {
+                        int idx = atoi(number.c_str());							// AND have a non-negetive index
+                        if(idx >= 0)
+                        {
+                            d->m_dref = arr;									// Now we know we're good, record all of our info
+                            d->m_types = tid;
+                            d->m_index = idx;
+                            char namec[32];
+                            sprintf(namec,"%p",d->m_dref);
+                            std::string name=namec;
+                            printf("Resolved singleton dref %s to %p\n",d->m_name.c_str(),d->m_dref);
+
+                        }
                     }
                 }
-                for(int i=0; i<size; ++i) {
-                    XTLuaArrayFloat* item=new XTLuaArrayFloat;
-                    item->ref=ref;
-                    item->type=arrayType;
-                    item->index=i;
-                    item->value=snapshot[i];
-                    item->get=true;
-                    initialNumbers.push_back(item);
-                }
-            } else if(types & (xplmType_Double | xplmType_Float | xplmType_Int)) {
-                XTLuaArrayFloat* item=new XTLuaArrayFloat;
-                item->ref=ref;
-                item->type=(types & xplmType_Double) ? xplmType_Double :
-                           (types & xplmType_Float) ? xplmType_Float : xplmType_Int;
-                item->value=read_scalar_snapshot(ref, item->type);
-                item->get=true;
-                initialNumbers.push_back(item);
-            }
-            // Providers may legally expose Data alongside numeric types.
-            // Publish both caches so the public Data-first Lua type remains valid.
-            if(types & xplmType_Data) {
-                initialString=new XTLuaCharArray;
-                initialString->ref=ref;
-                initialString->value=read_string_snapshot(ref);
-                initialString->get=true;
-            }
-            {
-                std::lock_guard<std::mutex> lock(data_mutex);
-                if(initialString) stringdataRefs.emplace(name, initialString);
-                if(arrayType || !initialNumbers.empty()) {
-                    floatdataRefs.emplace(name, std::move(initialNumbers));
-                    if(arrayType) arrayDataRefs[name]={ref, arrayType, false};
-                }
             }
         }
-        d->m_resolved.store(true, std::memory_order_release);
-        ++resolvedCount;
+
     }
-    for(xtlua_cmd* command : commands) {
-        if(!command) continue;
-        const XPLMCommandRef ref=XPLMFindCommand(command->m_name.c_str());
+
+    drefResolveQueue.clear();
+
+    for(xtlua_cmd * d:cmdResolveQueue){
+        XPLMCommandRef c = XPLMFindCommand(d->m_name.c_str());	
+	    if(c == NULL){
+		    printf("ERROR: Command %s not found\n",d->m_name.c_str());
+	    }
+        else
         {
-            std::lock_guard<std::mutex> lock(data_mutex);
-            command->m_cmd=ref;
+            printf("Resolved Command %s\n",d->m_name.c_str());
+            retVal++;
         }
-        if(ref) ++resolvedCount;
-        else pendingCommands.push_back(command);
+        d->m_cmd = c;
     }
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        drefResolveQueue.insert(drefResolveQueue.begin(), pendingDatarefs.begin(), pendingDatarefs.end());
-        cmdResolveQueue.insert(cmdResolveQueue.begin(), pendingCommands.begin(), pendingCommands.end());
-    }
-    return resolvedCount;
+    cmdResolveQueue.clear();
+
+    data_mutex.unlock();
+    return retVal;
 }
 std::vector<xtlua_cmd*> XTLuaDataRefs::XTGetHandlers(){
     std::vector<xtlua_cmd*> retval;
-    if(mainDispatchDepth != 0) return retval;
     std::lock_guard<std::mutex> lock(data_mutex);
     for (auto it=cmdHandlerResolveQueue.begin(); it!=cmdHandlerResolveQueue.end();) {
         xtlua_cmd * cmd=it->second;
@@ -1048,71 +1081,216 @@ std::vector<xtlua_cmd*> XTLuaDataRefs::XTGetHandlers(){
     }
     return retval;
 }
-double XTLuaDataRefs::XTGetDataf(xtlua_dref * d, bool local){
-    if(!d || !d->m_resolved.load(std::memory_order_acquire)) return 0.0;
-    if(d->m_ours) return xlua_dref_get_number(d->local_dref);
-    std::lock_guard<std::mutex> lock(data_mutex);
-    auto found=floatdataRefs.find(bridge_key(d->m_dref));
-    if(found == floatdataRefs.end() || found->second.empty()) return 0.0;
-    XTLuaArrayFloat* val=found->second[0];
-    val->get=true;
-    return val->value;
-}
+float XTLuaDataRefs::XTGetDataf(
+                                   xtlua_dref * d,bool local){
 
-void XTLuaDataRefs::XTSetDataf(xtlua_dref * d, double value, bool local){
-    if(!d || !d->m_resolved.load(std::memory_order_acquire)) return;
-    if(d->m_ours) {
-        xlua_dref_set_number(d->local_dref, value);
-        return;
+    float retVal=0;
+    
+    if(d->m_ours){
+        xlua_dref_ours(d->local_dref);
+        retVal= static_cast<float>(xlua_dref_get_number(d->local_dref));
     }
-    std::lock_guard<std::mutex> lock(data_mutex);
-    auto found=floatdataRefs.find(bridge_key(d->m_dref));
-    if(found == floatdataRefs.end() || found->second.empty()) return;
-    XTLuaArrayFloat* val=found->second[0];
-    if(val->type == xplmType_Int) value=xtlua_array_to_int(value);
-    else if(val->type == xplmType_Float) value=static_cast<float>(value);
-    // Even a repeated same-value write is a new generation: an SDK callback
-    // may be in flight with an earlier value and must not acknowledge this one.
-    val->value=value;
-    val->set=true;
-    ++val->version;
+   
+    XPLMDataRef  inDataRef=d->m_dref;
+    
+   // if(!local)
+     //   retVal=XPLMGetDataf(inDataRef);
+    char namec[32]={0};
+    sprintf(namec,"%p",inDataRef);
+    std::string name=namec;
+    data_mutex.lock();                       
+    if(floatdataRefs.find(name)!=floatdataRefs.end()){
+        std::vector<XTLuaArrayFloat*> val=floatdataRefs[name];
+        if(!d->m_ours){
+            val[0]->get=true;
+            changeddataRefs[name]=val;
+            retVal=val[0]->value;
+        }
+        else{
+            val[0]->value=retVal;
+        }
+        //floatdataRefs[name]=val;
+    }
+    else{
+        printf("didn't initialise %s\n",name.c_str());
+
+
+        
+
+    }
+    
+    data_mutex.unlock();
+    return retVal;                                   
+}
+void  XTLuaDataRefs::XTSetDataf(
+                                   xtlua_dref * d,    
+                                   float                inValue,bool local)
+{
+    //printf("set %p=%f\n",inDataRef,inValue) ;
+    //if(!local)
+     //   XPLMSetDataf(inDataRef,inValue);
+     //data_mutex.lock();
+     /*if(d->m_ours){
+        xlua_dref_ours(d->local_dref);
+        xlua_dref_set_number(d->local_dref,inValue);
+        //data_mutex.unlock();
+        return; 
+    }*/
+     data_mutex.lock();
+     
+    XPLMDataRef          inDataRef=d->m_dref;
+    char namec[32]={0};
+    sprintf(namec,"%p",inDataRef);
+    std::string name=namec;
+    if(floatdataRefs.find(name)!=floatdataRefs.end()){
+        std::vector<XTLuaArrayFloat*> val=floatdataRefs[name];
+        if(val[0]->value!=inValue){
+            if(!d->m_ours){
+                val[0]->set=true;
+                changeddataRefs[name]=val;
+                val[0]->value=inValue;
+            }
+            else{
+                xlua_dref_set_number(d->local_dref,inValue);
+                val[0]->value=inValue;
+            }
+        }
+    }
+    else{
+        printf("didn't initialise %s\n",name.c_str());
+
+    }
+
+    
+    data_mutex.unlock();
 }
 
-std::string XTLuaDataRefs::XTGetString(xtlua_dref * d){
-    if(!d) return {};
-    const bool synthetic=d->m_name.rfind("xtlua/", 0) == 0;
-    if(!synthetic && !d->m_resolved.load(std::memory_order_acquire)) return {};
-    if(!synthetic && d->m_ours) return xlua_dref_get_string(d->local_dref);
-    std::lock_guard<std::mutex> lock(data_mutex);
-    if(d->m_name.rfind("xtlua/xpFMSData", 0) == 0)
-        return currentDisplayedEntry;
-    if(d->m_name.rfind("xtlua/navaids", 0) == 0) {
+int XTLuaDataRefs::XTGetDatab(
+                                   xtlua_dref * d,    
+                                   void *               outValue,    /* Can be NULL */
+                                   int                  inOffset,    
+                                   int                  inMaxBytes,bool local)
+{
+    if(inOffset < 0 || inMaxBytes < 0)
+        return 0;
+    char *outValues =(char *)outValue;
+    data_mutex.lock();
+    if(d->m_name.rfind("xtlua/controlObject", 0) == 0){
+        printf("cant read control object\n");
+        data_mutex.unlock();
+        return 0;
+    }
+    if(d->m_name.rfind("xtlua/currentFMS", 0) == 0){
+        printf("cant read currentFMS object\n");
+        data_mutex.unlock();
+        return 0;
+    }
+    if(d->m_name.rfind("xtlua/xpFMSData", 0) == 0){
+        if(outValues!=NULL){
+            const char * charArray=currentDisplayedEntry.c_str();
+            for(unsigned int i=inOffset;i<currentDisplayedEntry.length()&&i-inOffset<(unsigned int)inMaxBytes;i++){
+                outValues[i-inOffset]=charArray[i];
+            }
+        }
+        int retVal=(int)currentDisplayedEntry.length();
+        data_mutex.unlock();
+        return retVal;
+    } 
+    if(d->m_name.rfind("xtlua/navaids", 0) == 0){
+       // std::string tS="testString";
+        //printf("reading navaids %d\n",localNavaidString.length());
+         skipNaviads=false;
+         if(outValues!=NULL){
+             const char * charArray=localNavaidString.c_str();
+                for(unsigned int i=inOffset;i<localNavaidString.length()&&i-inOffset<(unsigned int)inMaxBytes;i++){
+                    outValues[i-inOffset]=charArray[i];
+               }
+         }
+         else{
+             localNavaidString=incomingNavaidString;
+         }
+         int retVal=(int)localNavaidString.length();
+        data_mutex.unlock();
+        return retVal;
+    }
+    if(d->m_name.rfind("xtlua/fms", 0) == 0){
+       // std::string tS="testString";
+        //printf("reading navaids %d\n",localNavaidString.length());
         skipNaviads=false;
-        return incomingNavaidString;
+         if(outValues!=NULL){
+             
+             
+             const char * charArray=localFMSString.c_str();
+                for(unsigned int i=inOffset;i<localFMSString.length()&&i-inOffset<(unsigned int)inMaxBytes;i++){
+                    outValues[i-inOffset]=charArray[i];
+               }
+         }
+         else{
+             //if(localFMSString!=incomingFMSString)
+             //   printf("FMS=%s\n",incomingFMSString.c_str());
+             localFMSString=incomingFMSString;
+         }
+         int retVal=(int)localFMSString.length();
+        data_mutex.unlock();
+        return retVal;
     }
-    if(d->m_name.rfind("xtlua/fms", 0) == 0) {
-        skipNaviads=false;
-        return incomingFMSString;
-    }
-    if(synthetic) return {};
-    auto found=stringdataRefs.find(bridge_key(d->m_dref));
-    if(found == stringdataRefs.end()) return {};
-    found->second->get=true;
-    return found->second->value;
-}
+    
+    /*if(d->m_ours){
+        //data_mutex.unlock();
+        printf("Our ref XTGetDatab not implimented\n ");
+        data_mutex.unlock();
+        return 0; 
+    }*/
+    
+    //outValue will be an array of chars
+    XPLMDataRef  inDataRef=d->m_dref;
+    
+    char namec[32];
+    sprintf(namec,"%p",inDataRef);
+    std::string name=namec;
+   // printf("apply XTGetDatab %s[%d] %s\n",name.c_str(),inMaxBytes,outValues!=NULL?"values":"size");
+     int retVal=0;
+    
+    {
+        if(outValues!=NULL){
+            /*if(stringdataRefs.find(name)!=stringdataRefs.end()){
+                XTLuaChars val=stringdataRefs[name];
+                for(int i=inOffset;i<val.values.size()&&i-inOffset<inMaxBytes;i++){
+                    outValues[i-inOffset]=val.values[i];
+                    retVal++;
+                }
+                val.get=true;
+                stringdataRefs[name]=val;
+            }*/
+            if(stringdataRefs.find(name)!=stringdataRefs.end()){
+                XTLuaCharArray* val=stringdataRefs[name];
+                const char * charArray=val->value.c_str();
+                if(!d->m_ours){
+                    val->get=true;
+                   
+                }
+                for(unsigned int i=inOffset;i<val->value.length()&&i-inOffset<(unsigned int)inMaxBytes;i++){
+                    outValues[i-inOffset]=charArray[i];
+                    retVal++;
+                    //printf("apply XTGetDatavf %s %s[%d/%d] %s = %f\n",d->m_name.c_str(),name.c_str(),inOffset,inMax,outValues!=NULL?"values":"size",val[i]->value);
+                }
+            }
+        }
+        else
+        {
+             if(stringdataRefs.find(name)!=stringdataRefs.end()){
+                XTLuaCharArray* val=stringdataRefs[name];
+                retVal=(int)val->value.size();
+                if(!d->m_ours)
+                    val->get=true;
 
-int XTLuaDataRefs::XTGetDatab(xtlua_dref * d, void * outValue,
-                            int offset, int maxBytes, bool local){
-    if(offset < 0 || maxBytes < 0) return 0;
-    const std::string snapshot=XTGetString(d);
-    if(!outValue)
-        return static_cast<int>((std::min)(snapshot.size(),
-                            static_cast<size_t>((std::numeric_limits<int>::max)())));
-    const size_t start=static_cast<size_t>(offset);
-    if(start >= snapshot.size()) return 0;
-    const size_t copied=(std::min)(snapshot.size()-start, static_cast<size_t>(maxBytes));
-    std::memcpy(outValue, snapshot.data()+start, copied);
-    return static_cast<int>(copied);
+            }
+            
+        }
+        
+    }
+    data_mutex.unlock();
+    return retVal;
 }
 float camData[5]={0};
 bool controllingCam=false;
@@ -1131,7 +1309,6 @@ int XTLuaCameraFunc(
 		outCameraPosition->pitch = camData[3];
 		outCameraPosition->heading = camData[4];
 		outCameraPosition->roll = 0;		
-        outCameraPosition->zoom = 1.0f;
         //printf("XTLua Did Cam Control %f %f %f %f %f\n",camData[0],camData[1],camData[2],camData[3],camData[4]);
 	}
     else{
@@ -1145,129 +1322,154 @@ int XTLuaCameraFunc(
     }
 	return retVal;
 }
-void XTLuaDataRefs::XTSetDatab(xtlua_dref * d, std::string value){
-    if(!d) return;
-    if(d->m_name.rfind("xtlua/", 0) == 0) {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        if(acceptingRequests)
-            mainThreadQueue.push_back({d->m_name, std::move(value)});
-        return;
-    }
-    if(!d->m_resolved.load(std::memory_order_acquire)) return;
-    if(d->m_ours) {
-        xlua_dref_set_string(d->local_dref, value);
-        return;
-    }
-    if(value.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) return;
-    std::lock_guard<std::mutex> lock(data_mutex);
-    auto found=stringdataRefs.find(bridge_key(d->m_dref));
-    if(found == stringdataRefs.end()) return;
-    XTLuaCharArray* val=found->second;
-    val->value=std::move(value);
-    val->set=true;
-    ++val->version;
-}
-
-void XTLuaDataRefs::updateMainThreadRequests(){
-    if(updatingMainRequests || cleaning) return;
-    MainDispatchScope dispatch(mainDispatchDepth, updatingMainRequests);
-    std::vector<MainThreadRequest> batch;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        batch.swap(mainThreadQueue);
-    }
-    for(const MainThreadRequest& request : batch) {
-        try {
-            applyMainThreadRequest(request);
-        } catch(const std::exception& error) {
-            printf("XTLua: invalid main-thread request %s: %s\n",
-                   request.name.c_str(), error.what());
+void XTLuaDataRefs::XTSetDatab(
+                                   xtlua_dref * d,    
+                                   std::string value)
+{
+    
+    //char *inValues =(char *)inValue;
+    if(d->m_name.rfind("xtlua/", 0) == 0){
+        if(d->m_name.rfind("xtlua/getserial", 0) == 0){
+                printf("get serial %s\n",value.c_str());
+                serialWindow.init(value);//open a serial entry window
+                return;
         }
-    }
-}
+        else if(d->m_name.rfind("xtlua/currentFMSID", 0) == 0){
+            json fPlan=json::parse(incomingFMSString.c_str());
+            std::string::size_type sz;   // alias of size_t
 
-void XTLuaDataRefs::applyMainThreadRequest(const MainThreadRequest& request){
-    const std::string& name=request.name;
-    const std::string& value=request.value;
-    if(name.rfind("xtlua/getserial", 0) == 0) {
-        serialWindow.init(value);
-    } else if(name.rfind("xtlua/currentFMSID", 0) == 0) {
-        size_t consumed=0;
-        const long index=std::stol(value, &consumed);
-        if(consumed != value.size() || index <= 0 || index > XPLMCountFMSEntries())
+            int i_val = std::stoi (value,&sz)-1;
+            printf("setting current FMS target to %d\n",i_val);
+            XPLMSetDestinationFMSEntry(i_val);
+            //
             return;
-        XPLMSetDestinationFMSEntry(static_cast<int>(index-1));
-    } else if(name.rfind("xtlua/loadtoFMS", 0) == 0) {
-        const auto load=reinterpret_cast<XPLMLoadFMSFlightPlan_f>(XPLMFindSymbol("XPLMLoadFMSFlightPlan"));
-        if(!load || value.size() > (std::numeric_limits<unsigned int>::max)()) return;
-        const int count=XPLMCountFMSEntries();
-        for(int i=count-1; i>=0; --i) XPLMClearFMSEntry(i);
-        load(0, value.c_str(), static_cast<unsigned int>(value.size()));
-    } else if(name.rfind("xtlua/currentFMS", 0) == 0) {
-        const int count=XPLMCountFMSEntries();
-        for(int i=0; i<count; ++i) {
-            char ident[256]={};
-            XPLMGetFMSEntryInfo(i, nullptr, ident, nullptr, nullptr, nullptr, nullptr);
-            if(value == ident) {
-                XPLMSetDestinationFMSEntry(i);
-                break;
+        }
+        else if(d->m_name.rfind("xtlua/loadtoFMS", 0) == 0){
+            printf("autoload FMS\n");
+            int currentCount=XPLMCountFMSEntries();
+            for (int i=currentCount-1;i>=0;i--){    
+                XPLMClearFMSEntry(i);
+                
             }
+            printf("loading %s \n",value.c_str());
+            XPLMLoadFMSFlightPlan_f gLoadFMSFlightPlan = (XPLMLoadFMSFlightPlan_f)XPLMFindSymbol("XPLMLoadFMSFlightPlan");
+            if (gLoadFMSFlightPlan != NULL) {
+                 gLoadFMSFlightPlan(0,value.c_str(), static_cast<int>(strlen(value.c_str())));
+            }
+            return;
         }
-    } else if(name.rfind("xtlua/controlObject", 0) == 0) {
-        // Parse/validate before adding an object that lives only on the main thread.
-        const json data=json::parse(value);
-        data.at("srcDref").get<std::string>();
-        data.at("dstDref").get<std::string>();
-        for(const char* field : {"minin", "maxin", "minout", "maxout"})
-            if(!std::isfinite(data.at(field).get<double>())) return;
-        if(data.at("maxin").get<double>() == data.at("minin").get<double>()) return;
-        XTControlObject* control=new XTControlObject;
-        control->data=value;
-        controlOverrides.push_back(control);
-    } else if(name.rfind("xtlua/camera", 0) == 0) {
-        const std::vector<double> values=json::parse(value).get<std::vector<double>>();
-        if(values.size() < 5) return;
-        bool enabled=false;
-        for(size_t i=0; i<5; ++i) {
-            if(!std::isfinite(values[i]) ||
-               std::abs(values[i]) > (std::numeric_limits<float>::max)()) return;
-            enabled=enabled || values[i] != 0.0;
+        else if(d->m_name.rfind("xtlua/currentFMS", 0) == 0){
+            json fPlan=json::parse(incomingFMSString.c_str());
+
+            printf("setting current FMS target to %s\n",value.c_str());
+            for(size_t i=0;i<fPlan.size();i++){
+                string cName=fPlan[i][7].get<std::string>();
+                printf("current %zu is %s\n",i,cName.c_str());
+                if(cName==value){
+                    XPLMSetDestinationFMSEntry((int)i);
+                    return;
+                }
+            }
+            //
+            return;
         }
-        for(size_t i=0; i<5; ++i) camData[i]=static_cast<float>(values[i]);
-        wantsCamera=enabled ? 1 : 0;
-        if(!enabled && controllingCam) {
-            XPLMDontControlCamera();
-            controllingCam=false;
-        } else if(enabled && !controllingCam) {
-            controllingCam=true;
-            XPLMControlCamera(xplm_ControlCameraUntilViewChanges, XTLuaCameraFunc, nullptr);
+        else if(d->m_name.rfind("xtlua/controlObject", 0) == 0){
+            printf("creating control override object %s\n",value.c_str());
+            XTControlObject* override=new XTControlObject();
+            override->data=value;
+            data_mutex.lock();
+            controlOverrides.push_back(override);
+            data_mutex.unlock();
+            return;
         }
-    } else if(name.rfind("xtlua/fltpln", 0) == 0) {
-        // Validate the complete payload before modifying the current FMS plan.
-        const std::vector<std::vector<double>> waypoints=
-            json::parse(value).get<std::vector<std::vector<double>>>();
-        if(waypoints.size() > 100) return; // XPLM FMS entry limit.
-        for(const auto& waypoint : waypoints) {
-            if(waypoint.size() < 3 || !std::isfinite(waypoint[0]) ||
-               !std::isfinite(waypoint[1]) || !std::isfinite(waypoint[2]) ||
-               waypoint[0] < -90.0 || waypoint[0] > 90.0 ||
-               waypoint[1] < -180.0 || waypoint[1] > 180.0) return;
+        else if(d->m_name.rfind("xtlua/camera", 0) == 0){
+            printf("setting camera %s\n",value.c_str());
+            json jcamData=json::parse(value.c_str());
+            std::vector<double> thiscamData=jcamData.get<std::vector<double>>();
+            bool seenData=false;
+            for(int i=0;i<5;i++){
+                //printf("setting %d to %f\n",i,(float)thiscamData[i]);
+                camData[i]=(float)thiscamData[i];
+                if(camData[i]!=0.0)
+                    seenData=true;
+            }
+            if(seenData)
+                wantsCamera=1;
+            else
+                wantsCamera=0;
+            if(!controllingCam){
+                controllingCam=true;
+                XPLMControlCamera(xplm_ControlCameraUntilViewChanges, XTLuaCameraFunc, NULL);  
+            } 
+            return;
         }
-        const int count=XPLMCountFMSEntries();
-        for(int i=count-1; i>=0; --i) XPLMClearFMSEntry(i);
-        for(size_t i=0; i<waypoints.size(); ++i)
-            XPLMSetFMSEntryLatLon(static_cast<int>(i), static_cast<float>(waypoints[i][0]),
-                                 static_cast<float>(waypoints[i][1]),
-                                 xtlua_array_to_int(waypoints[i][2]));
+        else if(d->m_name.rfind("xtlua/fltpln", 0) == 0){
+            printf("setting flight plan %s\n",value.c_str());
+            json fpData=json::parse(value.c_str());
+            std::vector<json> waypoints=fpData.get<std::vector<json>>();
+            
+            int currentCount=XPLMCountFMSEntries();
+            printf("%d existing entries\n",currentCount);
+            printf("becoming %d entries\n",(int)waypoints.size());
+            //int start=currentCount;
+            //for (int i=0;i<currentCount&&XPLMCountFMSEntries()>0;i++){
+            for (int i=currentCount-1;i>=0;i--){    
+                XPLMClearFMSEntry(i);
+                //printf("clear to %d existing entries\n",currentCount);
+            }
+            for(unsigned int i=0;i<waypoints.size();i++){
+                std::vector<double> waypoint=waypoints[i].get<std::vector<double>>();
+                printf("%d got waypoint %d\n",i,(int)waypoint.size());
+                XPLMSetFMSEntryLatLon(i,(float)waypoint[0],(float)waypoint[1], static_cast<int>(std::lround(waypoint[2])));
+            }
+            printf("got flight plan for %d entries is %d entries\n",(int)waypoints.size(),XPLMCountFMSEntries());
+            return;
+        }
+        else if(d->m_name.rfind("xtlua/xpFMSData", 0) == 0){
+             printf("set xtlua/xpFMSData is INOP\n");
+             return;
+        }
     }
-}
+    if(d->m_ours){
+        //data_mutex.lock();
+        xlua_dref_ours(d->local_dref);
+        xlua_dref_set_string(d->local_dref,string(value));
+        //data_mutex.unlock();
+        //printf("set string %s\n",value.c_str());
+        //return; 
+    }
+    char namec[32];
+    XPLMDataRef  inDataRef=d->m_dref;
+    sprintf(namec,"%p",inDataRef);
+    std::string name=namec;
+    data_mutex.lock();
+    //printf("apply XTSetDatab %s[%d]\n",d->m_name.c_str(),inLength);
+    //if(inValues!=NULL)
+    {
+
+            auto valIt=stringdataRefs.find(name);
+            if(valIt == stringdataRefs.end() || valIt->second == nullptr){
+                data_mutex.unlock();
+                return;
+            }
+            XTLuaCharArray* val=valIt->second;
+            val->value=value;
+            if(!d->m_ours){
+                val->set=true;
+                 
+            }
+
+
+    }
+    data_mutex.unlock();
+}      
 int XTLuaDataRefs::XTGetDatavf(
                                    xtlua_dref * d,    
                                    double *             outValues,    /* Can be NULL */
                                    int                  inOffset,    
                                    int                  inMax,bool local)
 {
-    if(!d || !d->m_resolved.load(std::memory_order_acquire) || inOffset < 0 || inMax < 0)
+    if(inOffset < 0 || inMax < 0)
         return 0;
     int retVal=0;
     data_mutex.lock();
@@ -1325,7 +1527,7 @@ void XTLuaDataRefs::XTSetDatavf(
                                    double               inValue,
                                    int                  index)
 {
-    if(!d || !d->m_resolved.load(std::memory_order_acquire) || index < 0)
+    if(index < 0)
         return;
     data_mutex.lock();
     char namec[32];
@@ -1382,7 +1584,7 @@ void XTLuaDataRefs::XTSetDatavf(
 
 std::vector<double> XTLuaDataRefs::XTGetArrayValues(xtlua_dref * d, int offset, int count)
 {
-    if(!d || !d->m_resolved.load(std::memory_order_acquire) || offset < 0 || count < 0)
+    if(!d || offset < 0 || count < 0)
         return {};
     std::lock_guard<std::mutex> lock(data_mutex);
     char namec[32] = {0};
@@ -1426,7 +1628,7 @@ std::vector<double> XTLuaDataRefs::XTGetArrayValues(xtlua_dref * d, int offset, 
 
 int XTLuaDataRefs::XTSetArrayValues(xtlua_dref * d, const std::vector<double>& values, int offset)
 {
-    if(!d || !d->m_resolved.load(std::memory_order_acquire) || offset < 0)
+    if(!d || offset < 0)
         return -1;
     std::lock_guard<std::mutex> lock(data_mutex);
     char namec[32] = {0};

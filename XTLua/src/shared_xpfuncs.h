@@ -7,7 +7,6 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -40,20 +39,6 @@ private:
 std::string get_log_prefix(char level = 'I');
 std::filesystem::path get_current_script_path(lua_State * L);
 int log_message(lua_State * L, const char * format, ...);
-
-// All Lua runtimes enqueue owned text; enqueue never calls XPLM or touches a
-// different Lua state. Call set_main_thread() from XPluginStart before loading
-// scripts. It does not discard messages already queued by startup code.
-void xtlua_log_set_main_thread();
-void xtlua_queue_log(std::string message);
-
-// Only the registered X-Plane thread may drain. One call emits one FIFO batch
-// outside the queue mutex; worker/reentrant calls are no-ops. New messages stay
-// queued for the next drain, avoiding an unbounded flight-loop logging pass.
-// Drain every frame and after worker join / Lua destruction, including startup
-// failure and reload cleanup. Once producers are stopped, repeat until zero to
-// also emit any messages enqueued reentrantly during the last batch.
-std::size_t xtlua_flush_log_queue();
 
 std::shared_ptr<notify_cb_t> capture_lua_value(lua_State * L, int index);
 std::shared_ptr<notify_cb_t> wrap_lua_func_no_userref(

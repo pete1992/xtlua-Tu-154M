@@ -7,11 +7,11 @@ extern "C" {
 #include <lua.h>
 }
 
-#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -25,13 +25,6 @@ constexpr size_t kMaxFields = 128;
 constexpr size_t kMaxArrayValues = 4096;
 constexpr size_t kMaxTextBytes = 65536;
 
-constexpr uint32_t kRenderSlotCount = 3;
-constexpr uint32_t kSlotIndexMask = 0x3u;
-constexpr uint32_t kPublishedFrame = 0x80000000u;
-
-static_assert(std::atomic<uint32_t>::is_always_lock_free,
-	"XTLua's render bridge requires lock-free 32-bit atomics");
-
 using render_value = std::variant<double, bool, std::string, std::vector<double>>;
 
 struct render_frame {
@@ -39,96 +32,13 @@ struct render_frame {
 	std::map<std::string, render_value> fields;
 };
 
-// One instance has exactly one producer (xtlua_worker) and one consumer
-// (X-Plane's main thread). Slot ownership is transferred through middle_state:
-//
-//   worker_buffer --publish()--> middle --acquire()--> render_buffer
-//
-// The third slot lets either side keep its current buffer while the other side
-// advances. Intermediate published frames may be replaced; neither side waits.
-class render_channel {
-public:
-	bool matches(const char * bytes, size_t length) const
-	{
-		return name.size() == length &&
-			name.compare(0, name.size(), bytes, length) == 0;
-	}
+using render_frames = std::map<std::string, std::shared_ptr<const render_frame>>;
 
-	void prepare(const char * bytes, size_t length)
-	{
-		reset();
-		name.assign(bytes, length);
-	}
-
-	render_frame& worker_buffer()
-	{
-		return buffers[worker_slot];
-	}
-
-	void publish_worker_buffer()
-	{
-		// Release publishes the completed worker buffer. Acquire makes the
-		// returned slot writable only after the consumer released it.
-		const uint32_t previous = middle_state.exchange(
-			worker_slot | kPublishedFrame, std::memory_order_acq_rel);
-		worker_slot = previous & kSlotIndexMask;
-	}
-
-	void acquire_render_buffer()
-	{
-		if((middle_state.load(std::memory_order_acquire) &
-			kPublishedFrame) != 0)
-		{
-			// Release returns the old render slot to the producer. Acquire
-			// makes the newly published frame visible before it is copied to
-			// the main-thread Lua state.
-			const uint32_t previous = middle_state.exchange(
-				render_slot, std::memory_order_acq_rel);
-			render_slot = previous & kSlotIndexMask;
-		}
-	}
-
-	const render_frame * render_buffer() const
-	{
-		const render_frame& frame = buffers[render_slot];
-		return frame.sequence == 0 ? nullptr : &frame;
-	}
-
-	void reset()
-	{
-		name.clear();
-		for(render_frame& frame : buffers)
-		{
-			frame.sequence = 0;
-			frame.fields.clear();
-		}
-		render_slot = 0;
-		worker_slot = 2;
-		middle_state.store(1, std::memory_order_relaxed);
-	}
-
-private:
-	std::string name;
-	std::array<render_frame, kRenderSlotCount> buffers;
-
-	// The low two bits identify the middle slot. The high bit means that slot
-	// contains a completed frame which the consumer has not acquired yet.
-	std::atomic<uint32_t> middle_state{1};
-
-	// Accessed by only one side each; their slots are never shared.
-	uint32_t render_slot = 0;
-	uint32_t worker_slot = 2;
-};
-
-std::array<render_channel, kMaxChannels> channels;
-
-// A channel name is immutable after this release publication. Only the worker
-// adds channels; only the main thread reads the published prefix.
-std::atomic<uint32_t> published_channel_count{0};
-
-// Exactly one worker thread publishes. Keep the sequence monotonic across an
-// in-process script cleanup, matching the previous bridge contract.
-uint64_t next_sequence = 1;
+// An immutable map and immutable frames are published by pointer swap. The
+// main-thread reader never waits for worker Lua or holds a DataRef/SDK lock.
+std::shared_ptr<const render_frames> render_buffer =
+	std::make_shared<const render_frames>();
+std::atomic<uint64_t> next_sequence{1};
 
 enum class parse_error {
 	none,
@@ -142,8 +52,6 @@ enum class parse_error {
 
 parse_error copy_lua_frame(lua_State * L, render_frame& frame)
 {
-	frame.sequence = 0;
-	frame.fields.clear();
 	size_t text_bytes = 0;
 	lua_pushnil(L);
 	while(lua_next(L, 2) != 0)
@@ -268,78 +176,54 @@ const char * error_text(parse_error error)
 	return "invalid render buffer";
 }
 
-render_channel * find_worker_channel(
-	const char * name, size_t length, bool& is_new)
-{
-	const uint32_t count =
-		published_channel_count.load(std::memory_order_relaxed);
-	for(uint32_t i = 0; i < count; ++i)
-	{
-		if(channels[i].matches(name, length))
-		{
-			is_new = false;
-			return &channels[i];
-		}
-	}
-	if(count >= kMaxChannels)
-		return nullptr;
-	is_new = true;
-	channels[count].prepare(name, length);
-	return &channels[count];
-}
-
-const render_channel * find_render_channel(const char * name, size_t length)
-{
-	const uint32_t count =
-		published_channel_count.load(std::memory_order_acquire);
-	for(uint32_t i = 0; i < count; ++i)
-		if(channels[i].matches(name, length))
-			return &channels[i];
-	return nullptr;
-}
-
 int publish_render_buffer(lua_State * L)
 {
 	if(lua_type(L, 1) != LUA_TSTRING || lua_type(L, 2) != LUA_TTABLE)
 		return luaL_error(L, "XTLuaPublishRenderBuffer(channel, state) expected");
 	size_t channel_length = 0;
-	const char * channel_name = lua_tolstring(L, 1, &channel_length);
+	const char * channel = lua_tolstring(L, 1, &channel_length);
 	if(channel_length == 0 || channel_length > kMaxChannelLength)
 		return luaL_error(L, "render buffer channel must be 1..128 bytes");
 
-	bool is_new = false;
-	render_channel * channel =
-		find_worker_channel(channel_name, channel_length, is_new);
-	if(channel == nullptr)
-	{
-		lua_pushnil(L);
-		lua_pushstring(L, "too many render buffer channels");
-		return 2;
-	}
-
-	render_frame& worker_buffer = channel->worker_buffer();
-	const parse_error error = copy_lua_frame(L, worker_buffer);
+	auto worker_buffer = std::make_shared<render_frame>();
+	const parse_error error = copy_lua_frame(L, *worker_buffer);
 	if(error != parse_error::none)
 	{
-		if(is_new)
-			channel->reset();
 		lua_pushnil(L);
 		lua_pushstring(L, error_text(error));
 		return 2;
 	}
-
-	worker_buffer.sequence = next_sequence++;
-	const uint64_t sequence = worker_buffer.sequence;
-	channel->publish_worker_buffer();
-
-	if(is_new)
+	worker_buffer->sequence = next_sequence.fetch_add(1, std::memory_order_relaxed);
+	const std::string channel_name(channel, channel_length);
+	for(;;)
 	{
-		const uint32_t count =
-			published_channel_count.load(std::memory_order_relaxed);
-		published_channel_count.store(count + 1, std::memory_order_release);
+		auto current = std::atomic_load_explicit(
+			&render_buffer, std::memory_order_acquire);
+		// A publisher that built an older frame must not replace a newer one
+		// if multiple worker-side publishers are ever introduced.
+		const auto existing = current->find(channel_name);
+		if(existing != current->end() &&
+			existing->second->sequence >= worker_buffer->sequence)
+		{
+			lua_pushnumber(L, static_cast<lua_Number>(existing->second->sequence));
+			return 1;
+		}
+		if(current->size() >= kMaxChannels &&
+			current->find(channel_name) == current->end())
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "too many render buffer channels");
+			return 2;
+		}
+		auto updated = std::make_shared<render_frames>(*current);
+		(*updated)[channel_name] = worker_buffer;
+		std::shared_ptr<const render_frames> desired = updated;
+		if(std::atomic_compare_exchange_weak_explicit(
+				&render_buffer, &current, desired,
+				std::memory_order_release, std::memory_order_acquire))
+			break;
 	}
-
-	lua_pushnumber(L, static_cast<lua_Number>(sequence));
+	lua_pushnumber(L, static_cast<lua_Number>(worker_buffer->sequence));
 	return 1;
 }
 
@@ -367,29 +251,23 @@ int get_render_buffer(lua_State * L)
 	if(lua_type(L, 1) != LUA_TSTRING)
 		return luaL_error(L, "XLuaGetRenderBuffer(channel) expected");
 	size_t channel_length = 0;
-	const char * channel_name = lua_tolstring(L, 1, &channel_length);
-	const render_channel * channel =
-		find_render_channel(channel_name, channel_length);
-	if(channel == nullptr)
+	const char * channel = lua_tolstring(L, 1, &channel_length);
+	auto frames = std::atomic_load_explicit(
+		&render_buffer, std::memory_order_acquire);
+	const auto found = frames->find(std::string(channel, channel_length));
+	if(found == frames->end())
 	{
 		lua_pushnil(L);
 		return 1;
 	}
-
-	const render_frame * render_buffer = channel->render_buffer();
-	if(render_buffer == nullptr)
-	{
-		lua_pushnil(L);
-		return 1;
-	}
-
-	lua_createtable(L, 0, static_cast<int>(render_buffer->fields.size()));
-	for(const auto& field : render_buffer->fields)
+	const auto frame = found->second;
+	lua_createtable(L, 0, static_cast<int>(frame->fields.size()));
+	for(const auto& field : frame->fields)
 	{
 		push_render_value(L, field.second);
 		lua_setfield(L, -2, field.first.c_str());
 	}
-	lua_pushnumber(L, static_cast<lua_Number>(render_buffer->sequence));
+	lua_pushnumber(L, static_cast<lua_Number>(frame->sequence));
 	return 2;
 }
 
@@ -403,19 +281,10 @@ void xtlua_register_render_bridge(lua_State * L, module_runtime runtime)
 		lua_register(L, "XLuaGetRenderBuffer", get_render_buffer);
 }
 
-void xtlua_swap_render_buffers()
-{
-	const uint32_t count =
-		published_channel_count.load(std::memory_order_acquire);
-	for(uint32_t i = 0; i < count; ++i)
-		channels[i].acquire_render_buffer();
-}
-
 void xtlua_clear_render_bridge()
 {
-	// cleanupScripts() calls this only after the worker paused or joined, and
-	// the consumer runs on this same main thread.
-	published_channel_count.store(0, std::memory_order_release);
-	for(render_channel& channel : channels)
-		channel.reset();
+	std::shared_ptr<const render_frames> empty =
+		std::make_shared<const render_frames>();
+	std::atomic_store_explicit(
+		&render_buffer, std::move(empty), std::memory_order_release);
 }
