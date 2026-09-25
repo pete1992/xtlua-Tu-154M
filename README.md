@@ -6,11 +6,7 @@ XTLua is an asynchronous Lua runtime for X-Plane. Its `xtlua_worker` modules run
 the X-Plane frame loop. This leaves room for more complex Lua system logic
 without executing that logic on the X-Plane main thread.
 
-For the current local XLua capability comparison, file-by-file optimizations,
-API additions and remaining validation, see
-[XLUA_PARITY_README.md](XLUA_PARITY_README.md) and
-[GRAPHICS_API_README.md](GRAPHICS_API_README.md). This source update has not
-been compiled or tested in X-Plane.
+
 
 ### Runtime modes (2.4.x)
 
@@ -56,6 +52,11 @@ dynamic `.len`; main-thread SDK refresh uses a full-array snapshot and flushes
 worker writes in contiguous dirty ranges. The separate render bridge carries
 display state, not XPLM handles or draw commands. See [PHASE2_README.md](PHASE2_README.md)
 for API examples, limits and verification status.
+
+
+OLD README
+====
+
 
 
 XLua

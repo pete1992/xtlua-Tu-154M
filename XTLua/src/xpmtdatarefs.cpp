@@ -365,8 +365,8 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
               }
               else
               {
-                 char val[256];
-                sprintf(val,"%f %f",latDiff,lonDiff);
+                // char val[256];
+             //   sprintf(val,"%f %f",latDiff,lonDiff);
                  nVdata[count]=json::array({outRef,outType,0,0,outLat,outLon,string("latlon"),string("latlon"),outAltitude,(i==currentIndex)});
                  lastoutLat=outLat;
                 lastoutLon=outLon;

@@ -1,15 +1,7 @@
 # XTLua 2.4.9 – XLua-Abgleich und Optimierungsdurchgang
 
-Stand: 25.09.2026. Nur lokale Quellcode-/Skriptänderungen.
-Keine C++-Kompilierung, keine neuen Plugin-Binaries, keine Installation in
-X-Plane, kein Herunterfahren. Die gemeldeten erfolgreichen Simulator-Tests
-betreffen den vorherigen Stand, nicht diese Änderungen.
-
 ## Referenz und Reichweite
 
-Maßgeblich sind der **lokale XTLua-Code und das lokale SDK**. Der lokale Stand
-wurde nicht durch ein GitHub-Repository ersetzt.
-Zusätzlich wurde Laminar ausschließlich lesend verglichen:
 
 - [XLua-2-Referenz, f37b3aec](https://github.com/X-Plane/XLua/tree/f37b3aec5c36ba7b4ed719b9a7232efa978c0d26)
 - [Bootstrap und gemeinsame Lua-Helfer](https://github.com/X-Plane/XLua/blob/f37b3aec5c36ba7b4ed719b9a7232efa978c0d26/deploy/init.lua)
@@ -167,23 +159,6 @@ Letzter lokaler Prüflauf: 742 Thread-Grenzen-, 58 zusätzliche Classic-Bridge-,
 1409 SDK-Surface- und 218 Grafik-Quellcodechecks bestanden. Zusätzlich
 40 Command-Modellchecks und 80 Lua-Bootstrap-Stubchecks bestanden.
 
-Die Optimierungen reduzieren strukturell Kopien, Schlüsselkonvertierungen,
-Registry-Suchen und Lock-Verschachtelungen; Messwerte stehen aus.
 
-Als Nächstes:
 
-1. Neue Main-Wrap/Filter-, Array- und Multiwindow-Fälle in X-Plane abnehmen.
-   Besonders Resize/Writeback während SDK-Callbacks, Fehler und Reload testen.
-2. Typisierte Bild-/Textur-Lebensdauer für ImGui-Image-Funktionen ergänzen.
-   Keine OpenGL-IDs als PanelGraphics-Texturhandles ausgeben.
-3. Main→Worker-Bedienereignisse separat geordnet übertragen; keine
-   Lua-Callback- oder SDK-Handle-Weitergabe.
-4. Generierte Marshalling-/Invalid-Argument-Pfade sowie Registrierung aus
-   Lua-Coroutines einschließlich Thread-Pinning und Cleanup gesondert prüfen.
-   Der jetzige Abgleich bestätigt dort nicht sämtliche Lebenszeitfälle.
-5. Danach anhand von Simulatorprofilen die verbleibenden DataRef-Locks,
-   Snapshot-Allokationen und Renderkopien gezielt weiter optimieren.
 
-Vollständige Gleichheit mit jeder ImGui-C++-Funktion oder mit künftigen XLua-
-Vorschauversionen wird nicht behauptet. Die offenen Grafikfähigkeiten und
-konkreten Simulator-Testgruppen sind im Grafik-README aufgeführt.
