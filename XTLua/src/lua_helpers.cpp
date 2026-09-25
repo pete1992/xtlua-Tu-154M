@@ -17,6 +17,7 @@
 #include <XPLMUtilities.h>
 #include "xpmtdatarefs.h"
 #include "shared_xpfuncs.h"
+#include "module.h"
 extern XPLMDataRef				g_replay_active;
 extern XPLMDataRef				g_sim_period;
 
@@ -87,22 +88,10 @@ int validate_args(lua_State * L, const char * fmt)
 
 static int traceback(lua_State * L)
 {
-	luaL_traceback(L, L, lua_tostring(L, -1), 2);
-
-	std::string err = std::string(lua_tostring(L, -1)) + "\n";
-    //XPLMDebugString(err.c_str());
-	lua_getfield(L, LUA_GLOBALSINDEX, "debug");
-	lua_getfield(L, -1, "traceback");
-	lua_pushvalue(L, 1);
-	lua_pushinteger(L, 1);
-	lua_call(L,2,1);
-	
-//	lua_getfield(L, LUA_GLOBALSINDEX, "STP");
-//	lua_getfield(L, -1, "stacktrace");
-//	lua_pushvalue(L, 1);
-//	lua_pushinteger(L, 2);
-//	lua_call(L,2,1);
-//
+	// One traceback, independent of a script replacing the global debug table.
+	// Errors can be arbitrary Lua objects; never construct a string from NULL.
+	const char * message = lua_tostring(L, 1);
+	luaL_traceback(L, L, message ? message : "(non-string Lua error)", 1);
 	return 1;
 }
 
@@ -192,6 +181,13 @@ int vfmt_pcall(
 	const char * fmt,
 	va_list va)
 {
+	// The constructor's debug stack slot is not meaningful inside a reentrant
+	// C binding. Generated SDK callbacks still pass it for ABI compatibility;
+	// always install an error handler local to this actual pending call.
+	(void)dbg;
+	const int debug_index = lua_gettop(L);
+	lua_pushtraceback(L);
+	lua_insert(L, debug_index);
 	const char * f = fmt;
 	int count = 0;
 	while(*f)
@@ -224,7 +220,7 @@ int vfmt_pcall(
 		++f;
 		++count;
 	}
-	int e = lua_pcall(L, count, expects_return_value ? 1 : 0, dbg);
+	int e = lua_pcall(L, count, expects_return_value ? 1 : 0, debug_index);
 	if(e != 0)
 	{
 		const char * message = lua_tostring(L, -1);
@@ -233,6 +229,7 @@ int vfmt_pcall(
 			message ? message : "(non-string error)");
 		lua_pop(L, 1);
 	}
+	lua_remove(L, debug_index);
 	return e;
 }
 
@@ -285,6 +282,12 @@ void clear_table(lua_State * L, int idx)
 
 extern "C" int _XPLMPluginID_tostring(lua_State * L)
 {
+	module * owner = module::module_from_interp(L);
+	if(owner != NULL && owner->is_closing())
+	{
+		lua_pushliteral(L, "XPLMPluginID (module closing)");
+		return 1;
+	}
 	const XPLMPluginID plugin =
 		xlua_checkuserdata<XPLMPluginID>(L, 1, "Expected XPLMPluginID");
 	char name[256] = {};
@@ -295,6 +298,12 @@ extern "C" int _XPLMPluginID_tostring(lua_State * L)
 
 extern "C" int _XPLMHotKeyID_tostring(lua_State * L)
 {
+	module * owner = module::module_from_interp(L);
+	if(owner != NULL && owner->is_closing())
+	{
+		lua_pushliteral(L, "XPLMHotKeyID (module closing)");
+		return 1;
+	}
 	const XPLMHotKeyID hotkey =
 		xlua_checkuserdata<XPLMHotKeyID>(L, 1, "Expected XPLMHotKeyID");
 	char name[256] = {};
@@ -305,6 +314,12 @@ extern "C" int _XPLMHotKeyID_tostring(lua_State * L)
 
 extern "C" int _XPLMDataRef_tostring(lua_State * L)
 {
+	module * owner = module::module_from_interp(L);
+	if(owner != NULL && owner->is_closing())
+	{
+		lua_pushliteral(L, "XPLMDataRef (module closing)");
+		return 1;
+	}
 	const XPLMDataRef dataref =
 		xlua_checkuserdata<XPLMDataRef>(L, 1, "Expected XPLMDataRef");
 #if defined(XPLM400)

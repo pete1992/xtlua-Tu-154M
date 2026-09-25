@@ -2,29 +2,44 @@
 -- https://github.com/ignacio/StackTracePlus
 
 -- Grab STP conditionally, do not squawk if it is missing.
-if pcall(
-	function()
-		local STP_chunk = XLuaGetCode("../../StackTracePlus.lua")
-		local STP = STP_chunk()
-		debug.traceback = STP.stacktrace
-	end)
-then
-	print("Using STP as debugger.")
+-- if pcall(
+	-- function()
+		-- local STP_chunk = XLuaGetCode("../../StackTracePlus.lua")
+		-- local STP = STP_chunk()
+		-- debug.traceback = STP.stacktrace
+	-- end)
+-- then
+	-- print("Using STP as debugger.")
+-- end
+
+
+
+function dump(value)
+	local seen = {}
+	local parts = {}
+	local function append(item)
+		if type(item) ~= "table" then
+			parts[#parts + 1] = tostring(item)
+		elseif seen[item] then
+			parts[#parts + 1] = "<cycle>"
+		else
+			seen[item] = true
+			parts[#parts + 1] = "{ "
+			for key, child in pairs(item) do
+				parts[#parts + 1] = "[" .. tostring(key) .. "] = "
+				append(child)
+				parts[#parts + 1] = ","
+			end
+			parts[#parts + 1] = "} "
+			seen[item] = nil
+		end
+	end
+	append(value)
+	return table.concat(parts)
 end
 
-
-
-function dump(o)
-   if type(o) == 'table' then
-      local s = '{ '
-      for k,v in pairs(o) do
-         if type(k) ~= 'number' then k = '"'..k..'"' end
-         s = s .. '['..k..'] = ' .. dump(v) .. ','
-      end
-      return s .. '} '
-   else
-      return tostring(o)
-   end
+function isnan(value)
+	return type(value) == "number" and value ~= value
 end
 
 --------------------------------------------------------------------------------
@@ -34,33 +49,50 @@ end
 -- let authors work with 
 
 
-function dref_array_read(table,key)
-	idx = tonumber(key)
-	if idx == nil then
-		return nil
+local function bulk_values(values)
+	-- Classic module globals wrap plain tables into namespace proxies.
+	local mt = type(values) == "table" and getmetatable(values)
+	if mt and mt.__index == namespace_read then
+		local stored = rawget(values, "values")
+		local properties = rawget(values, "functions")
+		if next(properties) == nil then return stored end
+		local result = {}
+		for key, value in pairs(stored) do result[key] = value end
+		for key, property in pairs(properties) do result[key] = property.__get(property) end
+		return result
 	end
-	return XTLuaGetArray(table.dref,idx)
+	return values
 end
 
-function dref_array_write(table,key,value)
-	idx = tonumber(key)
-	if idx == nil then
-		return
-	end
-	XTLuaSetArray(table.dref,idx,value)
+local array_methods = {}
+function array_methods.get_values(self, offset, count)
+	return XTLuaGetArrayValues(self.dref, offset, count)
+end
+function array_methods.set_values(self, values, offset)
+	return XTLuaSetArrayValues(self.dref, bulk_values(values), offset)
 end
 
+function dref_array_read(array, key)
+	if key == "len" then
+		return XTLuaGetArrayLength(array.dref)
+	end
+	local method = array_methods[key]
+	if method ~= nil then return method end
+	local index = tonumber(key)
+	if index == nil then return nil end
+	return XTLuaGetArray(array.dref, index)
+end
+
+function dref_array_write(array, key, value)
+	local index = tonumber(key)
+	if index ~= nil then XTLuaSetArray(array.dref, index, value) end
+end
+
+local array_metatable = { __index = dref_array_read, __newindex = dref_array_write }
 function wrap_dref_array(in_dref, dim)
-	dr = {
-		dref = in_dref,
-		len = dim
-	}
-	mt = { __index = dref_array_read, __newindex = dref_array_write }
-	setmetatable(dr,mt)
-	return dr
+	-- Length is queried dynamically; dim is retained only for call compatibility.
+	return setmetatable({ dref = in_dref }, array_metatable)
 end
-
-
 
 function wrap_dref_number(in_dref)
 	return {
@@ -111,10 +143,10 @@ function wrap_dref_any_deferred(in_dref)
 			if self.arr ~= nil then
 				return self.arr
 			end
-			t = XTLuaGetDataRefType(self.dref)
-			b = string.find(t,"%[")
+			local t = XTLuaGetDataRefType(self.dref)
+			local b = string.find(t,"%[")
 			if b ~= nil then
-				dim = tonumber(string.sub(t,b+1,-2))
+				local dim = tonumber(string.sub(t,b+1,-2))
 				if dim == nil then
 					return nil
 				end
@@ -131,9 +163,13 @@ function wrap_dref_any_deferred(in_dref)
 		end,
 		__set = function(self,v)
 			if self.arr ~= nil then
-				return self.arr
+				return XTLuaSetArrayValues(self.dref, bulk_values(v))
 			end
-			t = XTLuaGetDataRefType(self.dref)
+			local t = XTLuaGetDataRefType(self.dref)
+			if string.find(t, "%[") ~= nil then
+				self.arr = wrap_dref_array(self.dref)
+				return XTLuaSetArrayValues(self.dref, bulk_values(v))
+			end
 			if t == "string" then
 				return XTLuaSetString(self.dref,v)
 			elseif t == "number" then
@@ -149,9 +185,9 @@ function wrap_dref_any_deferred(in_dref)
 end
 	
 function wrap_dref_any(dref,t)	
-	b = string.find(t,"%[")
+	local b = string.find(t,"%[")
 	if b ~= nil then
-		dim = tonumber(string.sub(t,b+1,-2))
+		local dim = tonumber(string.sub(t,b+1,-2))
 		if dim == nil then
 			return nil
 		end
@@ -167,8 +203,8 @@ function wrap_dref_any(dref,t)
 end
 
 function find_dataref(name)	
-	dref = XTLuaFindDataRef(name)
-	t = XTLuaGetDataRefType(dref)
+	local dref = XTLuaFindDataRef(name)
+	local t = XTLuaGetDataRefType(dref)
 	return wrap_dref_any(dref,t)
 end
 
@@ -187,55 +223,35 @@ end
 -- COMMAND LUA GLUE
 --------------------------------------------------------------------------------
 
+local command_methods = {}
+local function command_handle(self)
+	if self.cmd == nil then self.cmd = XTLuaFindCommand(self.name) end
+	if self.cmd == nil then error("Unable to find command: " .. tostring(self.name), 3) end
+	return self.cmd
+end
+function command_methods.start(self) XTLuaCommandStart(command_handle(self)) end
+function command_methods.stop(self) XTLuaCommandStop(command_handle(self)) end
+function command_methods.once(self) XTLuaCommandOnce(command_handle(self)) end
+local command_metatable = { __index = command_methods }
 function make_command_obj(in_cmd, in_name)
-	return { 
-		start = function(self)
-			if self.cmd == nil then
-				self.cmd = XTLuaFindCommand(self.name)
-				if self.cmd == nil then
-					error("Unable to find command:"..name)
-				end
-			end
-			XTLuaCommandStart(self.cmd)
-		end,
-		stop = function(self)
-			if self.cmd == nil then
-				self.cmd = XTLuaFindCommand(self.name)
-				if self.cmd == nil then
-					error("Unable to find command:"..name)
-				end
-			end
-			XTLuaCommandStop(self.cmd)
-		end,
-		once = function(self)
-			if self.cmd == nil then
-				self.cmd = XTLuaFindCommand(self.name)
-				if self.cmd == nil then
-					error("Unable to find command:"..name)
-				end
-			end
-			XTLuaCommandOnce(self.cmd)
-		end,
-		cmd = in_cmd,
-		name = in_name
-	}
+	return setmetatable({ cmd = in_cmd, name = in_name }, command_metatable)
 end
 
 function find_command(name)
-	c = XTLuaFindCommand(name)
+	local c = XTLuaFindCommand(name)
 	return make_command_obj(c,name)
 end
 
 function replace_command(name, func)
-	c = XTLuaFindCommand(name)
+	local c = XTLuaFindCommand(name)
 	XTLuaReplaceCommand(c,func)
-	return make_command_obj(c)
+	return make_command_obj(c,name)
 end	
 
 function wrap_command(name, before, after)
-	c = XTLuaFindCommand(name)
+	local c = XTLuaFindCommand(name)
 	XTLuaWrapCommand(c,before,after)
-	return make_command_obj(c)
+	return make_command_obj(c,name)
 end
 
 --------------------------------------------------------------------------------
@@ -243,7 +259,7 @@ end
 --------------------------------------------------------------------------------
 
 function run_timer(func,delay,rep)
-	tobj = all_timers[func]
+	local tobj = all_timers[func]
 	if tobj == nil then
 		tobj = XTLuaCreateTimer(func)
 		all_timers[func] = tobj
@@ -252,18 +268,23 @@ function run_timer(func,delay,rep)
 end
 
 function stop_timer(func)
-	tobj = all_timers[func]
+	local tobj = all_timers[func]
 	if tobj ~= nil then
 		XTLuaRunTimer(tobj, -1.0, -1.0)
 	end
 end
 
 function is_timer_scheduled(func)
-	tobj = all_timers[func]
+	local tobj = all_timers[func]
 	if tobj == nil then
 		return false
 	end
 	return XTLuaIsTimerScheduled(tobj)
+end
+
+function get_timer_remaining(func)
+	local tobj = all_timers[func]
+	return tobj ~= nil and XTLuaGetTimerRemaining(tobj) or 0
 end
 
 function run_at_interval(func, interval)
@@ -284,8 +305,8 @@ function seems_like_prop(p)
 	if type(p) ~= "table" then
 		return false
 	end
-	gfunc = rawget(p,"__get")
-	sfunc = rawget(p,"__set")
+	local gfunc = rawget(p,"__get")
+	local sfunc = rawget(p,"__set")
 	if type(gfunc) ~= "function" then
 		return false
 	end
@@ -313,8 +334,8 @@ end
 function namespace_ipairs(table, i)
 	local function namespace_iter(table, i)
 		i = i + 1
-		ftable = rawget(table,'functions')
-		vtable = rawget(table,'values')
+		local ftable = rawget(table,'functions')
+		local vtable = rawget(table,'values')
 		local fv = ftable[i]
 		if fv ~= nil then
 			return i,fv.__get(fv)
@@ -337,19 +358,19 @@ end
 
 function namespace_pairs(table, key, value)
 	local function namespace_next(table, index)
-		ftable = rawget(table,'functions')
-		vtable = rawget(table,'values')
+		local ftable = rawget(table,'functions')
+		local vtable = rawget(table,'values')
 		if index == nil then
-			idx_f,key_f = next(ftable, nil)
+			local idx_f,key_f = next(ftable, nil)
 			if idx_f == nil then
-				idx_v,key_v = next(vtable, nil)
+				local idx_v,key_v = next(vtable, nil)
 				return idx_v,key_v
 			else
 				return idx_f,key_f.__get(key_f)
 			end
 		else
 			if ftable[index] ~= nil then
-				idx_f,key_f = next(ftable,index)
+				local idx_f,key_f = next(ftable,index)
 				if idx_f == nil then
 					return next(vtable, nil)
 				else
@@ -366,21 +387,28 @@ end
 
 function namespace_write(table, key, value)
 	--print("Namespace write of "..key)
-	ftable = rawget(table,'functions')
-	vtable = rawget(table,'values')
+	local ftable = rawget(table,'functions')
+	local vtable = rawget(table,'values')
+	local rkeys = rawget(table,'raw_table_keys')
 
-	func = ftable[key]
+	local existing = vtable[key]
+	if type(existing) == "table" and getmetatable(existing) == array_metatable and type(value) == "table" then
+		XTLuaSetArrayValues(existing.dref, bulk_values(value))
+		return
+	end
+	local func = ftable[key]
 	if func ~= nil then
 		func.__set(func,value)
 	else
 		if seems_like_prop(value) then
 			ftable[key] = value
 		else
-			if not seems_like_object(value) and type(value) == "table" and getmetatable(value) == nil then
+			if not seems_like_object(value) and type(value) == "table" and getmetatable(value) == nil and rkeys[key] == nil then
 				--print("Bare table wrap for "..key)
-				v = {
+				local v = {
 					functions = {},
 					values = {},
+					raw_table_keys = {},
 					parent = nil
 				}
 				for k,vv in pairs(value) do
@@ -401,26 +429,28 @@ function namespace_write(table, key, value)
 end
 
 function namespace_read(table,key)
-	ftable = rawget(table,'functions')
-	vtable = rawget(table,'values')
-	func = ftable[key]
+	local ftable = rawget(table,'functions')
+	local vtable = rawget(table,'values')
+	local func = ftable[key]
 	if func ~= nil then
 		return func.__get(func)
 	end
-	var = vtable[key]
+	local var = vtable[key]
 	if var ~= nil then
 		return var
 	end
-	if table.parent ~= nil then
-		return table.parent[key]
+	local parent = rawget(table, 'parent')
+	if parent ~= nil then
+		return parent[key]
 	end
 	return nil
 end
 
 function create_namespace()
-	ret = { 
+	local ret = {
 		functions = {}, 
 		values = {},
+		raw_table_keys = {},
 		create_prop = function(self,name, func)
 			self.functions[name] = func
 		end,
@@ -428,7 +458,7 @@ function create_namespace()
 	}
 	-- TODO: use __len operator to restore # for Jim
 	-- TODO: look at __pairs, __ipairs support
-	mt = { __index = namespace_read, __newindex = namespace_write, __pairs = namespace_pairs, __ipairs = namespace_ipairs, __len = namespace_len }
+	local mt = { __index = namespace_read, __newindex = namespace_write, __pairs = namespace_pairs, __ipairs = namespace_ipairs, __len = namespace_len }
 	setmetatable(ret,mt)
 	return ret
 end
@@ -437,19 +467,35 @@ end
 -- find same-dir scripts and does a setfenv to our NS
 function get_run_file_in_namespace(ns)
 	return function(fname)
-		chunk = XLuaGetCode(fname)
-		if chunk == nil then
-			print("Error: unable to load the file '"..full_path.."' for dofile.")
-			print(debug.traceback())
-			print("")
-		else
-			setfenv(chunk,ns)
-			chunk()
+		local chunk = XLuaGetCode(fname)
+		if type(chunk) ~= "function" then
+			error("Unable to load '" .. tostring(fname) .. "': " .. tostring(chunk), 2)
 		end
+		setfenv(chunk, ns)
+		return chunk()
 	end
 end
 
 --------------------------------------------------------------------------------
+
+-- SDK registration and synchronous filtering require an init/main module.
+function create_command(name, desc, handler)
+	error("create_command requires an xtlua_main init script", 2)
+end
+function filter_command(name, filter)
+	error("filter_command is synchronous and requires an xtlua_main init script", 2)
+end
+
+function get_real_table_in_namespace(ns)
+	return function(key, real_table)
+		rawget(ns, 'values')[key] = real_table
+	end
+end
+function get_raw_table_in_namespace(ns)
+	return function(key)
+		rawget(ns, 'raw_table_keys')[key] = true
+	end
+end
 
 function run_module_in_namespace(fn)
 	n = create_namespace()
@@ -463,14 +509,18 @@ function run_module_in_namespace(fn)
 	n.create_command = create_command
 	n.find_command = find_command
 	n.wrap_command = wrap_command
+	n.filter_command = filter_command
 	n.replace_command = replace_command
 	
 	n.run_timer = run_timer
 	n.stop_timer = stop_timer
 	n.is_timer_scheduled = is_timer_scheduled
+	n.get_timer_remaining = get_timer_remaining
 	n.run_after_time = run_after_time
 	n.run_at_interval = run_at_interval
 	n.dofile = get_run_file_in_namespace(n)
+	n.real_table = get_real_table_in_namespace(n)
+	n.raw_table = get_raw_table_in_namespace(n)
 	
 	setfenv(fn,n)
 	fn()
@@ -481,7 +531,7 @@ function setup_callback_var(var_name,var_value)
 end
 
 function do_callout(fname)
-	func=n[fname]
+	local func=n[fname]
 	if func ~= nil then
 		if STP ~= nil then
 			STP.add_known_function(func, fname)

@@ -39,12 +39,11 @@
 //    m_repeat_interval == -1.0  -> One-Shot (nach dem Feuern abmelden)
 //    Ein delay von -1.0 an run_timer() bedeutet daher "abbestellen".
 //
-//  THREADING-HINWEIS (T8, bewusst nicht gefixt)
-//    Es gibt keinen Mutex. Solange nur xtlua_worker die xtlua_*-Funktionen
-//    und nur xtlua_main die xlua_*-Funktionen benutzt, ist das tragbar.
-//    ABER: xtlua_timer_cleanup() raeumt BEIDE Listen ab und wird aus dem
-//    Sim-Thread gerufen - laeuft dabei parallel Lua-Code, der Timer anlegt
-//    oder umplant, ist das ein Race.
+//  THREAD-GRENZE
+//    Fahrplaene und Listen werden unter timer_mutex kopiert/geaendert,
+//    niemals Lua-Callbacks. Die Zeit kommt ausschliesslich aus dem Snapshot.
+//    Cleanup erfordert weiterhin einen pausierten/beendeten Worker: Ein Mutex
+//    schuetzt Timer-Knoten, nicht die Lebenszeit eines laufenden Lua-States.
 //------------------------------------------------------------------------------
 
 #include <cstdio>
@@ -54,9 +53,6 @@
 #include "shared_xpfuncs.h"
 #include <stdlib.h>
 #include <stdio.h>
-//#include <XPLMProcessing.h>
-#include <XPLMDataAccess.h>
-#include <XPLMUtilities.h>
 
 #include <algorithm>
 #include <list>
@@ -64,6 +60,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <mutex>
+#include <cstdint>
 
 struct xlua_timer {
 	xlua_timer *		m_next;
@@ -72,11 +70,17 @@ struct xlua_timer {
 	
 	double			m_next_fire_time;
 	double			m_repeat_interval;	// -1 to stop after 1
+	std::uint64_t	m_identity;
+	std::uint64_t	m_revision;
 	
 };
 
 static xlua_timer * x_timers;
 static xlua_timer * l_timers;
+static std::mutex timer_mutex;
+static std::uint64_t next_timer_identity = 0;
+static bool worker_timer_dispatch_active = false;
+static bool main_timer_dispatch_active = false;
 
 // XLua 2 timers deliberately do not share the xtlua linked lists above. They
 // retain their owning lua_State so one module can be torn down without touching
@@ -86,38 +90,24 @@ struct xlua2_timer {
 	std::shared_ptr<notify_cb_t>	m_callback;
 	double						m_next_fire_time;
 	double						m_repeat_interval;
+	std::uint64_t				m_identity;
+	std::uint64_t				m_revision = 0;
 
-	xlua2_timer(lua_State * owner, std::shared_ptr<notify_cb_t> callback) :
+	xlua2_timer(lua_State * owner, std::shared_ptr<notify_cb_t> callback,
+		std::uint64_t identity) :
 		m_owner(owner),
 		m_callback(std::move(callback)),
 		m_next_fire_time(-1.0),
-		m_repeat_interval(-1.0)
+		m_repeat_interval(-1.0),
+		m_identity(identity)
 	{
 	}
 };
 
 static std::list<xlua2_timer> xlua2_timers;
+static std::uint64_t next_xlua2_timer_identity = 0;
+static bool xlua2_timer_dispatch_active = false;
 static const char * const xlua2_timer_callback_key = "TimerCallback";
-
-static int xlua2_debug_proc(lua_State * L)
-{
-	// XLua 2 module setup stores the traceback stack index here. Accept both a
-	// plain number and the userdata form used by Laminar's direct loader.
-	lua_getglobal(L, "__debug_proc");
-	int debug_proc = 0;
-	if(lua_isnumber(L, -1))
-	{
-		debug_proc = static_cast<int>(lua_tointeger(L, -1));
-	}
-	else if(lua_type(L, -1) == LUA_TUSERDATA)
-	{
-		int * value = static_cast<int *>(lua_touserdata(L, -1));
-		if(value != NULL)
-			debug_proc = *value;
-	}
-	lua_pop(L, 1);
-	return debug_proc;
-}
 
 static int xlua2_absolute_stack_index(lua_State * L, int index)
 {
@@ -165,7 +155,11 @@ static void xlua2_invoke_timer(const std::shared_ptr<notify_cb_t>& callback)
 		callback.get(),
 		xlua2_timer_callback_key);
 	if(L != NULL)
-		fmt_pcall_stdvars(L, xlua2_debug_proc(L), false, "");
+	{
+		// The loader's saved index is not necessarily valid on a reentrant C
+		// callback stack. Do not dereference script-replaceable debug userdata.
+		fmt_pcall_stdvars(L, 0, false, ""); // helper owns the local traceback
+	}
 }
 
 xlua2_timer * xlua2_create_timer(lua_State * L, int function_index)
@@ -189,7 +183,7 @@ xlua2_timer * xlua2_create_timer(lua_State * L, int function_index)
 		return NULL;
 	}
 
-	xlua2_timers.emplace_back(L, std::move(callback));
+	xlua2_timers.emplace_back(L, std::move(callback), ++next_xlua2_timer_identity);
 	return &xlua2_timers.back();
 }
 
@@ -216,6 +210,7 @@ bool xlua2_run_timer(
 	const auto found = xlua2_timer_iterator(L, timer);
 	if(found == xlua2_timers.end())
 		return false;
+	++found->m_revision;
 
 	if(delay < 0.0)
 	{
@@ -249,27 +244,43 @@ double xlua2_get_timer_remaining(lua_State * L, xlua2_timer * timer)
 
 void xlua2_do_timers_for_time(double now)
 {
+	if(xlua2_timer_dispatch_active)
+		return;
+	xlua2_timer_dispatch_active = true;
+	struct reset_dispatch {
+		~reset_dispatch() { xlua2_timer_dispatch_active = false; }
+	} reset;
 	// Callbacks can reschedule timers and can indirectly tear down a complete
-	// interpreter. Snapshot only identities, then revalidate every timer before
-	// touching it. Newly created timers start on the following flight-loop pass.
-	std::vector<std::pair<lua_State *, xlua2_timer *> > due_timers;
+	// interpreter. Identity/revision guards also reject allocator address reuse
+	// or an existing timer rearmed by an earlier callback in this dispatch.
+	struct due_timer {
+		lua_State * owner;
+		xlua2_timer * timer;
+		std::uint64_t identity;
+		std::uint64_t revision;
+	};
+	std::vector<due_timer> due_timers;
 	for(xlua2_timer& timer : xlua2_timers)
 	{
 		module * owner = module::module_from_interp(timer.m_owner);
 		if(owner != NULL && owner->is_enabled() &&
 			timer.m_next_fire_time >= 0.0 && timer.m_next_fire_time <= now)
-			due_timers.emplace_back(timer.m_owner, &timer);
+			due_timers.push_back({timer.m_owner, &timer, timer.m_identity, timer.m_revision});
 	}
 
 	for(const auto& due : due_timers)
 	{
-		auto found = xlua2_timer_iterator(due.first, due.second);
+		auto found = xlua2_timer_iterator(due.owner, due.timer);
 		if(found == xlua2_timers.end() ||
+			found->m_identity != due.identity || found->m_revision != due.revision ||
 			found->m_next_fire_time < 0.0 ||
 			found->m_next_fire_time > now)
 		{
 			continue;
 		}
+		module * owner = module::module_from_interp(found->m_owner);
+		if(owner == NULL || !owner->is_enabled())
+			continue;
 
 		// Set the default next state before entering Lua. A callback that calls
 		// XLuaRunTimer for itself therefore wins and keeps its new schedule.
@@ -364,181 +375,201 @@ static void xlua_advance_timer(xlua_timer * t, double now)
 		t->m_next_fire_time = now + t->m_repeat_interval;
 }
 
+static xlua_timer * find_timer(xlua_timer * head, xlua_timer * wanted)
+{
+	for(xlua_timer * timer = head; timer; timer = timer->m_next)
+		if(timer == wanted)
+			return timer;
+	return NULL;
+}
+
+static xlua_timer * create_timer(xlua_timer *& head, xlua_timer_f func, void * ref)
+{
+	std::lock_guard<std::mutex> lock(timer_mutex);
+	for(xlua_timer * timer = head; timer; timer = timer->m_next)
+		if(timer->m_func == func && timer->m_ref == ref)
+		{
+			std::fprintf(stderr, "xtlua: ERROR: timer already exists.\n");
+			return NULL;
+		}
+	xlua_timer * timer = new xlua_timer;
+	timer->m_next = head;
+	timer->m_next_fire_time = -1.0;
+	timer->m_repeat_interval = -1.0;
+	timer->m_func = func;
+	timer->m_ref = ref;
+	timer->m_identity = ++next_timer_identity;
+	timer->m_revision = 0;
+	head = timer;
+	return timer;
+}
+
+static void run_timer(xlua_timer *& head, xlua_timer * timer, double delay, double repeat)
+{
+	const double now = xlua_get_simulated_time();
+	std::lock_guard<std::mutex> lock(timer_mutex);
+	if(!find_timer(head, timer))
+		return;
+	++timer->m_revision;
+	timer->m_repeat_interval = repeat;
+	timer->m_next_fire_time = delay == -1.0 ? -1.0 : now + delay;
+}
+
+static int timer_scheduled(xlua_timer *& head, xlua_timer * timer)
+{
+	std::lock_guard<std::mutex> lock(timer_mutex);
+	return find_timer(head, timer) && timer->m_next_fire_time != -1.0;
+}
+
+static double timer_remaining(xlua_timer *& head, xlua_timer * timer)
+{
+	const double now = xlua_get_simulated_time();
+	std::lock_guard<std::mutex> lock(timer_mutex);
+	if(!find_timer(head, timer) || timer->m_next_fire_time == -1.0)
+		return -1.0;
+	return (std::max)(0.0, timer->m_next_fire_time - now);
+}
+
 xlua_timer * xlua_create_timer(xlua_timer_f func, void * ref)
 {
-	for(xlua_timer * t = l_timers; t; t = t->m_next)
-	if(t->m_func == func && t->m_ref == ref)
-	{
-		// FIX T6: printf ohne \n klebte an der naechsten Logzeile und war
-		// ohne Konsole ohnehin nicht sichtbar.
-		std::fprintf(stderr, "xtlua: ERROR: timer already exists.\n");
-		return NULL;
-	}
-
-	xlua_timer * nt = new xlua_timer;
-	nt->m_next = l_timers;
-	l_timers = nt;
-	nt->m_next_fire_time = -1.0;
-	nt->m_repeat_interval = -1.0;
-	nt->m_func = func;
-	nt->m_ref = ref;
-	return nt;
-}
-
-void xlua_run_timer(xlua_timer * t, double delay, double repeat)
-{
-	// FIX T1: xlua_create_timer() liefert bei einem Duplikat NULL, und
-	// xlua_is_timer_scheduled() prueft NULL sehr wohl - hier fehlte die Pruefung,
-	// also war ein Crash direkt aus Lua heraus ausloesbar.
-	if(t == NULL)
-		return;
-
-	t->m_repeat_interval = repeat;
-	if(delay == -1.0)
-		t->m_next_fire_time = delay;		// -1.0 = abbestellen
-	else
-		t->m_next_fire_time = xlua_get_simulated_time() + delay;
-}
-
-int xlua_is_timer_scheduled(xlua_timer * t)
-{
-	if(t == NULL)
-		return 0;
-	if(t->m_next_fire_time == -1.0)
-		return 0;
-	return 1;	
-}
-
-double xlua_get_timer_remaining(xlua_timer * t)
-{
-	if(t == NULL || t->m_next_fire_time == -1.0)
-		return -1.0;
-	const double remaining = t->m_next_fire_time - xlua_get_simulated_time();
-	return remaining > 0.0 ? remaining : 0.0;
+	return create_timer(l_timers, func, ref);
 }
 xlua_timer * xtlua_create_timer(xlua_timer_f func, void * ref)
 {
-	for(xlua_timer * t = x_timers; t; t = t->m_next)
-	if(t->m_func == func && t->m_ref == ref)
+	return create_timer(x_timers, func, ref);
+}
+void xlua_run_timer(xlua_timer * timer, double delay, double repeat)
+{
+	run_timer(l_timers, timer, delay, repeat);
+}
+void xtlua_run_timer(xlua_timer * timer, double delay, double repeat)
+{
+	run_timer(x_timers, timer, delay, repeat);
+}
+int xlua_is_timer_scheduled(xlua_timer * timer)
+{
+	return timer_scheduled(l_timers, timer);
+}
+int xtlua_is_timer_scheduled(xlua_timer * timer)
+{
+	return timer_scheduled(x_timers, timer);
+}
+double xlua_get_timer_remaining(xlua_timer * timer)
+{
+	return timer_remaining(l_timers, timer);
+}
+double xtlua_get_timer_remaining(xlua_timer * timer)
+{
+	return timer_remaining(x_timers, timer);
+}
+
+struct timer_dispatch_scope {
+	bool& active;
+	bool entered;
+	explicit timer_dispatch_scope(bool& dispatch_active) : active(dispatch_active)
 	{
-		// FIX T6: siehe oben.
-		std::fprintf(stderr, "xtlua: ERROR: timer already exists.\n");
-		return NULL;
+		std::lock_guard<std::mutex> lock(timer_mutex);
+		entered = !active;
+		if(entered)
+			active = true;
 	}
+	~timer_dispatch_scope()
+	{
+		if(entered)
+		{
+			std::lock_guard<std::mutex> lock(timer_mutex);
+			active = false;
+		}
+	}
+};
 
-	xlua_timer * nt = new xlua_timer;
-	nt->m_next = x_timers;
-	x_timers = nt;
-	nt->m_next_fire_time = -1.0;
-	nt->m_repeat_interval = -1.0;
-	nt->m_func = func;
-	nt->m_ref = ref;
-	return nt;
+static void dispatch_timers(xlua_timer *& head, double now)
+{
+	struct due_timer {
+		xlua_timer * timer;
+		std::uint64_t identity;
+		std::uint64_t revision;
+	};
+	std::vector<due_timer> due;
+	{
+		std::lock_guard<std::mutex> lock(timer_mutex);
+		for(xlua_timer * timer = head; timer; timer = timer->m_next)
+			if(timer->m_next_fire_time != -1.0 && timer->m_next_fire_time <= now)
+				due.push_back({timer, timer->m_identity, timer->m_revision});
+	}
+	for(const due_timer& item : due)
+	{
+		xlua_timer_f callback = NULL;
+		void * ref = NULL;
+		{
+			std::lock_guard<std::mutex> lock(timer_mutex);
+			xlua_timer * timer = find_timer(head, item.timer);
+			// An earlier callback may cancel/rearm this timer, remove the whole
+			// list, or create a new timer at a recycled address.
+			if(!timer || timer->m_identity != item.identity ||
+				timer->m_revision != item.revision ||
+				timer->m_next_fire_time == -1.0 || timer->m_next_fire_time > now)
+				continue;
+			xlua_advance_timer(timer, now);
+			callback = timer->m_func;
+			ref = timer->m_ref;
+		}
+		// No timer/list lock crosses Lua. A self-reschedule wins; newly created
+		// or rearmed timers are considered in the next dispatch, not this batch.
+		if(callback)
+			callback(ref);
+	}
 }
 
-void xtlua_run_timer(xlua_timer * t, double delay, double repeat)
+void xtlua_do_timers_for_time(double now, bool isPaused)
 {
-	// FIX T1: siehe xlua_run_timer.
-	if(t == NULL)
-		return;
-
-	t->m_repeat_interval = repeat;
-	if(delay == -1.0)
-		t->m_next_fire_time = delay;
-	else
-		t->m_next_fire_time = xlua_get_simulated_time() + delay;
-}
-
-int xtlua_is_timer_scheduled(xlua_timer * t)
-{
-	if(t == NULL)
-		return 0;
-	if(t->m_next_fire_time == -1.0)
-		return 0;
-	return 1;	
-}
-
-double xtlua_get_timer_remaining(xlua_timer * t)
-{
-	if(t == NULL || t->m_next_fire_time == -1.0)
-		return -1.0;
-	const double remaining = t->m_next_fire_time - xlua_get_simulated_time();
-	return remaining > 0.0 ? remaining : 0.0;
-}
-
-void xtlua_do_timers_for_time(double now,bool isPaused)
-{
-	// FIX T4: Das Original uebersprang bei Pause nur den Callback, schrieb den
-	// Fahrplan aber weiter fort. Ein One-Shot, dessen Zeitpunkt waehrend der
-	// Pause erreicht wurde, bekam damit m_next_fire_time = -1.0 und war
-	// geloescht, OHNE je gefeuert zu haben. Bei Pause wird die Liste jetzt
-	// gar nicht angefasst - der Timer feuert nach dem Fortsetzen nach.
 	if(isPaused)
 		return;
-
-	// FIX T2: m_next wird VOR dem Callback gesichert. Der Callback ist
-	// Lua-Code und kann (ueber einen Reload / xtlua_timer_cleanup) die Liste
-	// abraeumen - danach waere t freigegeben und t->m_next ein
-	// Use-after-free.
-	xlua_timer * t = x_timers;
-	while(t)
-	{
-		xlua_timer * next = t->m_next;
-
-		if(t->m_next_fire_time != -1.0 && t->m_next_fire_time <= now)
-		{
-			// FIX T3/T5: Fahrplan zuerst, Callback danach - so darf der
-			// Callback sich selbst neu einplanen, ohne ueberschrieben zu werden.
-			xlua_advance_timer(t, now);
-			t->m_func(t->m_ref);
-		}
-
-		t = next;
-	}
+	timer_dispatch_scope dispatch(worker_timer_dispatch_active);
+	if(dispatch.entered)
+		dispatch_timers(x_timers, now);
 }
-void xlua_do_timers_for_time(double now,bool isPaused)
+
+void xlua_do_timers_for_time(double now, bool isPaused)
 {
-	// FIX T7: Diese (Sim-Thread-)Variante ignoriert den Pausenzustand
-	// absichtlich - Verhalten wie im Original. Der Parameter bleibt fuer die
-	// gemeinsame Signatur erhalten, wird hier aber nicht ausgewertet.
-	(void) isPaused;
-
-	// FIX T2/T3/T5: identisch zur xtlua-Variante, siehe Kommentare dort.
-	xlua_timer * t = l_timers;
-	while(t)
-	{
-		xlua_timer * next = t->m_next;
-
-		if(t->m_next_fire_time != -1.0 && t->m_next_fire_time <= now)
-		{
-			xlua_advance_timer(t, now);
-			t->m_func(t->m_ref);
-		}
-
-		t = next;
-	}
-
-	// XLua 2 modules live on the X-Plane thread and use direct SDK bindings.
-	// Keep their per-state timers out of the xtlua list, but drive them from
-	// the same main-thread flight-loop callback.
+	(void)isPaused; // xtlua_main preserves its existing pause-independent mode.
+	timer_dispatch_scope dispatch(main_timer_dispatch_active);
+	if(!dispatch.entered)
+		return;
+	dispatch_timers(l_timers, now);
 	xlua2_do_timers_for_time(now);
 }
+
+bool xlua_is_main_timer_dispatch_active()
+{
+	std::lock_guard<std::mutex> lock(timer_mutex);
+	return main_timer_dispatch_active || xlua2_timer_dispatch_active;
+}
+
 void xtlua_timer_cleanup()
 {
-	// Hinweis (T8): raeumt bewusst beide Listen ab; zum Thread-Risiko siehe
-	// den Kommentar am Dateianfang.
-	while(l_timers)
+	// Lifecycle guarantees no worker callback is running, and module shutdown
+	// guards forbid finalizers from creating or using timers after retirement.
+	xlua_timer * old_main;
+	xlua_timer * old_worker;
 	{
-		xlua_timer * k = l_timers;
-		l_timers = l_timers->m_next;
-		delete k;
+		std::lock_guard<std::mutex> lock(timer_mutex);
+		old_main = l_timers;
+		old_worker = x_timers;
+		l_timers = NULL;
+		x_timers = NULL;
 	}
-	while(x_timers)
+	while(old_main)
 	{
-		xlua_timer * k = x_timers;
-		x_timers = x_timers->m_next;
-		delete k;
+		xlua_timer * next = old_main->m_next;
+		delete old_main;
+		old_main = next;
 	}
-
+	while(old_worker)
+	{
+		xlua_timer * next = old_worker->m_next;
+		delete old_worker;
+		old_worker = next;
+	}
 	xlua2_timer_cleanup();
 }

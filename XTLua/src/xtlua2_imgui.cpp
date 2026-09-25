@@ -5,7 +5,7 @@
 
 #include "module.h"
 #include "shared_xpfuncs.h"
-
+#include "lua_helpers.h"
 #include <XPLMDefs.h>
 #include <XPLMDisplay.h>
 #include <XPLMPanelGraphics.h>
@@ -18,6 +18,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -34,7 +35,7 @@ static_assert(sizeof(ImDrawIdx) == sizeof(uint16_t),
 
 class imgui_context {
 public:
-	explicit imgui_context(int width, int height)
+	explicit imgui_context(int width, int height, bool upload_now)
 	{
 		ImGuiContext * previous = ImGui::GetCurrentContext();
 		context = ImGui::CreateContext();
@@ -61,7 +62,8 @@ public:
 			"0123456789 .,;:!?+-*/()[]{}");
 		ImGui::End();
 		ImGui::Render();
-		update_textures();
+		if(upload_now)
+			update_textures();
 		ImGui::SetCurrentContext(previous);
 	}
 
@@ -81,6 +83,7 @@ public:
 
 	ImGuiContext * get() const { return context; }
 	bool in_frame() const { return frame_active; }
+	std::vector<char>& text_buffer() { return text_scratch; }
 
 	// Called only at creation and from the registered main-thread flight loop,
 	// never from the panel draw callback. Recreate on incremental atlas updates
@@ -177,10 +180,20 @@ public:
 		ImGui::Render();
 		frame_active = false;
 		const bool wants_text = ImGui::GetIO().WantTextInput;
-		if(current_window != nullptr && wants_text != has_focus)
+		if(current_window != nullptr)
 		{
-			XPLMTakeKeyboardFocus(wants_text ? current_window : nullptr);
-			has_focus = wants_text;
+			const bool owns_focus = XPLMHasKeyboardFocus(current_window) != 0;
+			// An unfocused context may retain its active InputText item. Do not
+			// let its next draw steal keyboard focus back from a sibling window.
+			if(wants_text && !owns_focus && focus_request_allowed)
+			{
+				XPLMTakeKeyboardFocus(current_window);
+				focus_request_allowed = false;
+			}
+			else if(!wants_text && owns_focus)
+				XPLMTakeKeyboardFocus(nullptr);
+			if(!wants_text)
+				focus_request_allowed = true;
 		}
 		ImDrawData * draw = ImGui::GetDrawData();
 		if(draw == nullptr)
@@ -194,7 +207,10 @@ public:
 			mesh.vertices = reinterpret_cast<const float *>(list->VtxBuffer.Data);
 			mesh.index_count = list->IdxBuffer.Size;
 			mesh.indices = reinterpret_cast<const uint16_t *>(list->IdxBuffer.Data);
-			std::vector<XPLMDrawCall_t> calls;
+			// Reuse capacity across draw lists and frames. Only this window's
+			// main-thread context owns the scratch storage.
+			std::vector<XPLMDrawCall_t>& calls = draw_calls;
+			calls.clear();
 			calls.reserve(static_cast<size_t>(list->CmdBuffer.Size));
 			for(int i = 0; i < list->CmdBuffer.Size; ++i)
 			{
@@ -246,7 +262,14 @@ public:
 		if(translate_mouse(win, x, y, local_x, local_y))
 			ImGui::GetIO().AddMousePosEvent(local_x, local_y);
 		if(status == xplm_MouseDown || status == xplm_MouseUp)
+		{
+			if(status == xplm_MouseDown)
+			{
+				focus_request_allowed = true;
+				ImGui::GetIO().AddFocusEvent(true);
+			}
 			ImGui::GetIO().AddMouseButtonEvent(button, status == xplm_MouseDown);
+		}
 		return ImGui::GetIO().WantCaptureMouse ? 1 : 0;
 	}
 
@@ -272,9 +295,11 @@ public:
 		if(losing_focus)
 		{
 			io.ClearInputKeys();
-			has_focus = false;
+			io.AddFocusEvent(false);
+			focus_request_allowed = false;
 			return;
 		}
+		io.AddFocusEvent(true);
 		push_modifiers();
 		const unsigned char vk = static_cast<unsigned char>(virtual_key);
 		ImGuiKey mapped = ImGuiKey_None;
@@ -293,6 +318,9 @@ public:
 			case XPLM_VK_RIGHT: mapped = ImGuiKey_RightArrow; break;
 			case XPLM_VK_UP: mapped = ImGuiKey_UpArrow; break;
 			case XPLM_VK_DOWN: mapped = ImGuiKey_DownArrow; break;
+			case XPLM_VK_PRIOR: mapped = ImGuiKey_PageUp; break;
+			case XPLM_VK_NEXT: mapped = ImGuiKey_PageDown; break;
+			case XPLM_VK_INSERT: mapped = ImGuiKey_Insert; break;
 			case XPLM_VK_HOME: mapped = ImGuiKey_Home; break;
 			case XPLM_VK_END: mapped = ImGuiKey_End; break;
 			case XPLM_VK_BACK: mapped = ImGuiKey_Backspace; break;
@@ -341,24 +369,38 @@ private:
 
 	ImGuiContext * context = nullptr;
 	XPLMWindowID current_window = nullptr;
-	bool has_focus = false;
 	bool frame_active = false;
+	bool focus_request_allowed = true;
 	float last_frame_time = 0.0f;
 	std::unordered_set<void *> textures;
+	std::vector<XPLMDrawCall_t> draw_calls;
+	std::vector<char> text_scratch;
 };
 
 struct window_state {
 	lua_State * L = nullptr;
-	imgui_context * imgui = nullptr;
+	std::unique_ptr<imgui_context> imgui;
 	int draw_ref = LUA_NOREF;
 	bool drawing = false;
 	bool pending_destroy = false;
 };
 
-std::unordered_map<lua_State *, std::unique_ptr<imgui_context>> states;
 std::unordered_map<XPLMWindowID, std::unique_ptr<window_state>> windows;
+// The active context is selected by the native window callback, never merely
+// by its Lua state: one xlua2_main state may own several independent windows.
+lua_State * drawing_lua = nullptr;
+imgui_context * drawing_context = nullptr;
 bool texture_loop_registered = false;
+bool texture_loop_running = false;
 float texture_tick(float, float, int, void *);
+
+imgui_context * active_context(lua_State * L)
+{
+	return drawing_lua == L && drawing_context != nullptr &&
+		drawing_context->in_frame() &&
+		ImGui::GetCurrentContext() == drawing_context->get() ?
+		drawing_context : nullptr;
+}
 
 void destroy_window(XPLMWindowID win)
 {
@@ -366,25 +408,20 @@ void destroy_window(XPLMWindowID win)
 	if(found == windows.end())
 		return;
 	window_state * state = found->second.get();
-	if(state->drawing)
+	if(drawing_context != nullptr || state->drawing)
 	{
 		state->pending_destroy = true;
 		return;
 	}
+	// Detach before SDK destruction: a native callback can reenter and attempt
+	// to destroy the same handle. Retain the state until that SDK call returns.
+	state->pending_destroy = true;
+	std::unique_ptr<window_state> retired = std::move(found->second);
+	windows.erase(found);
 	XPLMDestroyWindow(win);
 	if(state->draw_ref != LUA_NOREF)
 		luaL_unref(state->L, LUA_REGISTRYINDEX, state->draw_ref);
-	lua_State * owner_state = state->L;
-	windows.erase(found);
-	// Drop frame timing, focus, and GPU textures with the last window so a
-	// later window in this Lua state starts with a clean context.
-	const bool has_owner_window = std::any_of(windows.begin(), windows.end(),
-		[owner_state](const auto& entry) {
-			return entry.second->L == owner_state;
-		});
-	if(!has_owner_window)
-		states.erase(owner_state);
-	if(windows.empty() && texture_loop_registered)
+	if(windows.empty() && texture_loop_registered && !texture_loop_running)
 	{
 		XPLMUnregisterFlightLoopCallback(texture_tick, nullptr);
 		texture_loop_registered = false;
@@ -393,30 +430,51 @@ void destroy_window(XPLMWindowID win)
 
 float texture_tick(float, float, int, void *)
 {
+	if(drawing_context != nullptr)
+		return -1.0f;
+	texture_loop_running = true;
+	// Destroying textures/windows is deferred until the draw callback has
+	// returned, including a Lua request to destroy a different window.
+	for(auto it = windows.begin(); it != windows.end(); )
+	{
+		const XPLMWindowID id = it->first;
+		const bool pending = it->second->pending_destroy;
+		++it;
+		if(pending)
+			destroy_window(id);
+	}
 	ImGuiContext * previous = ImGui::GetCurrentContext();
-	for(auto& entry : states)
-		entry.second->update_textures();
+	for(auto& entry : windows)
+		entry.second->imgui->update_textures();
 	ImGui::SetCurrentContext(previous);
-	return -1.0f;
+	texture_loop_running = false;
+	// The SDK forbids unregistering this callback from its own stack. Returning
+	// zero leaves an inactive registration; the next window reactivates it.
+	return windows.empty() ? 0.0f : -1.0f;
 }
 
 void draw_window(XPLMWindowID win, void * refcon)
 {
 	window_state * state = static_cast<window_state *>(refcon);
-	if(state == nullptr || state->pending_destroy)
+	if(state == nullptr || state->pending_destroy || drawing_context != nullptr)
+		return;
+	module * owner = module::module_from_interp(state->L);
+	if(owner == nullptr || owner->is_closing() || !owner->is_enabled())
 		return;
 	int left = 0, top = 0, right = 0, bottom = 0;
 	XPLMGetWindowGeometry(win, &left, &top, &right, &bottom);
 	ImGuiContext * previous = ImGui::GetCurrentContext();
 	state->drawing = true;
+	drawing_lua = state->L;
+	drawing_context = state->imgui.get();
 	state->imgui->begin_frame(win, right - left, top - bottom);
 	if(state->draw_ref != LUA_NOREF)
 	{
+		const int debug = lua_pushtraceback(state->L);
 		lua_rawgeti(state->L, LUA_REGISTRYINDEX, state->draw_ref);
 		Make_XPLMWindowID(state->L, win);
 		lua_pushinteger(state->L, right - left);
 		lua_pushinteger(state->L, top - bottom);
-		const int debug = module::debug_proc_from_interp(state->L);
 		if(lua_pcall(state->L, 3, 0, debug) != 0)
 		{
 			const char * message = lua_tostring(state->L, -1);
@@ -424,12 +482,13 @@ void draw_window(XPLMWindowID win, void * refcon)
 				message ? message : "(non-string Lua error)");
 			lua_pop(state->L, 1);
 		}
+		lua_remove(state->L, debug);
 	}
 	state->imgui->end_frame();
 	ImGui::SetCurrentContext(previous);
 	state->drawing = false;
-	if(state->pending_destroy)
-		destroy_window(win);
+	drawing_context = nullptr;
+	drawing_lua = nullptr;
 }
 
 int mouse_click(XPLMWindowID win, int x, int y,
@@ -487,10 +546,13 @@ int wheel_event(XPLMWindowID win, int x, int y, int wheel,
 int table_int(lua_State * L, const char * key, int fallback)
 {
 	lua_getfield(L, 1, key);
-	const int value = lua_isnil(L, -1) ? fallback :
-		static_cast<int>(luaL_checkinteger(L, -1));
+	const lua_Integer value = lua_isnil(L, -1) ? fallback :
+		luaL_checkinteger(L, -1);
+	if(value < (std::numeric_limits<int>::min)() ||
+		value > (std::numeric_limits<int>::max)())
+		luaL_error(L, "window field '%s' exceeds integer range", key);
 	lua_pop(L, 1);
-	return value;
+	return static_cast<int>(value);
 }
 
 bool table_bool(lua_State * L, const char * key, bool fallback)
@@ -502,6 +564,15 @@ bool table_bool(lua_State * L, const char * key, bool fallback)
 	return value;
 }
 
+int text_buffer_capacity(lua_State * L, int argument, int fallback, size_t length)
+{
+	const lua_Integer requested = luaL_optinteger(L, argument, fallback);
+	if(requested > 1024 * 1024 || length >= 1024 * 1024)
+		return luaL_argerror(L, argument, "text buffer exceeds 1 MiB");
+	const int capacity = requested < 1 ? 1 : static_cast<int>(requested);
+	return (std::max)(capacity, static_cast<int>(length) + 1);
+}
+
 // The vendored macro-generated binder cannot represent char* + capacity
 // input widgets. Keep the normal Lua convention: (changed, updated_text).
 int input_text(lua_State * L)
@@ -509,7 +580,7 @@ int input_text(lua_State * L)
 	const char * label = luaL_checkstring(L, 1);
 	size_t length = 0;
 	const char * original = luaL_checklstring(L, 2, &length);
-	int capacity = static_cast<int>(luaL_optinteger(L, 3, 256));
+	const int capacity = text_buffer_capacity(L, 3, 256, length);
 	const int flags = static_cast<int>(luaL_optinteger(L, 4, 0));
 	if((flags & (ImGuiInputTextFlags_CallbackCompletion |
 		ImGuiInputTextFlags_CallbackHistory |
@@ -518,21 +589,17 @@ int input_text(lua_State * L)
 		ImGuiInputTextFlags_CallbackResize |
 		ImGuiInputTextFlags_CallbackEdit)) != 0)
 		return luaL_argerror(L, 4, "callback flags are not supported");
-	auto state = states.find(L);
-	if(state == states.end() || !xtlua2_imgui_frame_active(L))
+	imgui_context * context = active_context(L);
+	if(context == nullptr)
 	{
 		lua_pushboolean(L, 0);
 		lua_pushvalue(L, 2);
 		return 2;
 	}
-	if(capacity < 1)
-		capacity = 1;
-	if(capacity > 1024 * 1024 || length >= 1024 * 1024)
-		return luaL_argerror(L, 3, "text buffer exceeds 1 MiB");
-	capacity = (std::max)(capacity, static_cast<int>(length) + 1);
-	std::vector<char> buffer(static_cast<size_t>(capacity), '\0');
+	std::vector<char>& buffer = context->text_buffer();
+	buffer.resize(static_cast<size_t>(capacity));
 	std::memcpy(buffer.data(), original, length);
-	ImGui::SetCurrentContext(state->second->get());
+	buffer[length] = '\0';
 	const bool changed = ImGui::InputText(label, buffer.data(),
 		buffer.size(), static_cast<ImGuiInputTextFlags>(flags));
 	lua_pushboolean(L, changed);
@@ -546,7 +613,7 @@ int input_text_with_hint(lua_State * L)
 	const char * hint = luaL_checkstring(L, 2);
 	size_t length = 0;
 	const char * original = luaL_checklstring(L, 3, &length);
-	int capacity = static_cast<int>(luaL_optinteger(L, 4, 256));
+	const int capacity = text_buffer_capacity(L, 4, 256, length);
 	const int flags = static_cast<int>(luaL_optinteger(L, 5, 0));
 	if((flags & (ImGuiInputTextFlags_CallbackCompletion |
 		ImGuiInputTextFlags_CallbackHistory |
@@ -555,21 +622,17 @@ int input_text_with_hint(lua_State * L)
 		ImGuiInputTextFlags_CallbackResize |
 		ImGuiInputTextFlags_CallbackEdit)) != 0)
 		return luaL_argerror(L, 5, "callback flags are not supported");
-	auto state = states.find(L);
-	if(state == states.end() || !xtlua2_imgui_frame_active(L))
+	imgui_context * context = active_context(L);
+	if(context == nullptr)
 	{
 		lua_pushboolean(L, 0);
 		lua_pushvalue(L, 3);
 		return 2;
 	}
-	if(capacity < 1)
-		capacity = 1;
-	if(capacity > 1024 * 1024 || length >= 1024 * 1024)
-		return luaL_argerror(L, 4, "text buffer exceeds 1 MiB");
-	capacity = (std::max)(capacity, static_cast<int>(length) + 1);
-	std::vector<char> buffer(static_cast<size_t>(capacity), '\0');
+	std::vector<char>& buffer = context->text_buffer();
+	buffer.resize(static_cast<size_t>(capacity));
 	std::memcpy(buffer.data(), original, length);
-	ImGui::SetCurrentContext(state->second->get());
+	buffer[length] = '\0';
 	const bool changed = ImGui::InputTextWithHint(label, hint, buffer.data(),
 		buffer.size(), static_cast<ImGuiInputTextFlags>(flags));
 	lua_pushboolean(L, changed);
@@ -582,7 +645,7 @@ int input_text_multiline(lua_State * L)
 	const char * label = luaL_checkstring(L, 1);
 	size_t length = 0;
 	const char * original = luaL_checklstring(L, 2, &length);
-	int capacity = static_cast<int>(luaL_optinteger(L, 3, 4096));
+	const int capacity = text_buffer_capacity(L, 3, 4096, length);
 	const float width = static_cast<float>(luaL_optnumber(L, 4, 0.0));
 	const float height = static_cast<float>(luaL_optnumber(L, 5, 0.0));
 	const int flags = static_cast<int>(luaL_optinteger(L, 6, 0));
@@ -593,21 +656,17 @@ int input_text_multiline(lua_State * L)
 		ImGuiInputTextFlags_CallbackResize |
 		ImGuiInputTextFlags_CallbackEdit)) != 0)
 		return luaL_argerror(L, 6, "callback flags are not supported");
-	auto state = states.find(L);
-	if(state == states.end() || !xtlua2_imgui_frame_active(L))
+	imgui_context * context = active_context(L);
+	if(context == nullptr)
 	{
 		lua_pushboolean(L, 0);
 		lua_pushvalue(L, 2);
 		return 2;
 	}
-	if(capacity < 1)
-		capacity = 1;
-	if(capacity > 1024 * 1024 || length >= 1024 * 1024)
-		return luaL_argerror(L, 3, "text buffer exceeds 1 MiB");
-	capacity = (std::max)(capacity, static_cast<int>(length) + 1);
-	std::vector<char> buffer(static_cast<size_t>(capacity), '\0');
+	std::vector<char>& buffer = context->text_buffer();
+	buffer.resize(static_cast<size_t>(capacity));
 	std::memcpy(buffer.data(), original, length);
-	ImGui::SetCurrentContext(state->second->get());
+	buffer[length] = '\0';
 	const bool changed = ImGui::InputTextMultiline(label, buffer.data(),
 		buffer.size(), ImVec2(width, height),
 		static_cast<ImGuiInputTextFlags>(flags));
@@ -620,9 +679,7 @@ int input_text_multiline(lua_State * L)
 
 bool xtlua2_imgui_frame_active(lua_State * L)
 {
-	const auto state = states.find(L);
-	return state != states.end() && state->second->in_frame() &&
-		ImGui::GetCurrentContext() == state->second->get();
+	return active_context(L) != nullptr;
 }
 
 void xtlua2_imgui_register_text_inputs(lua_State * L)
@@ -645,14 +702,6 @@ extern "C" int XLuaCreateImguiWindow(lua_State * L)
 	module * owner = module::module_from_interp(L);
 	if(owner == nullptr || owner->get_runtime() != module_runtime::xlua2_main)
 		return luaL_error(L, "XLuaCreateImguiWindow requires xlua2_main");
-	// This host uses one ImGui context per Lua state. A second native window
-	// would share input, focus, and frame timing with the first one.
-	for(const auto& entry : windows)
-	{
-		if(entry.second->L == L)
-			return luaL_error(L,
-				"only one ImGui window per xlua2_main state is supported");
-	}
 	luaL_checktype(L, 1, LUA_TTABLE);
 	XPLMCreateWindow_t params{};
 	params.structSize = sizeof(params);
@@ -662,6 +711,11 @@ extern "C" int XLuaCreateImguiWindow(lua_State * L)
 	params.bottom = table_int(L, "bottom", 100);
 	if(params.right <= params.left || params.top <= params.bottom)
 		return luaL_error(L, "ImGui window geometry must have positive size");
+	if(static_cast<int64_t>(params.right) - params.left >
+		(std::numeric_limits<int>::max)() ||
+		static_cast<int64_t>(params.top) - params.bottom >
+		(std::numeric_limits<int>::max)())
+		return luaL_error(L, "ImGui window dimensions exceed integer range");
 	params.visible = table_bool(L, "visible", true) ? 1 : 0;
 	params.decorateAsFloatingWindow = static_cast<XPLMWindowDecoration>(
 		table_int(L, "decorateAsFloatingWindow",
@@ -684,15 +738,11 @@ extern "C" int XLuaCreateImguiWindow(lua_State * L)
 		lua_pop(L, 1);
 	}
 
-	auto context = states.find(L);
-	const bool created_context = context == states.end();
-	if(context == states.end())
-	{
-		std::unique_ptr<imgui_context> created(new imgui_context(
-			params.right - params.left, params.top - params.bottom));
-		context = states.emplace(L, std::move(created)).first;
-	}
-	window->imgui = context->second.get();
+	// Each native window owns all ImGui state (input/focus, font atlas, timing,
+	// scratch buffers). A window created from a draw callback uploads textures
+	// on the next main flight-loop tick, not recursively from that callback.
+	window->imgui.reset(new imgui_context(params.right - params.left,
+		params.top - params.bottom, drawing_context == nullptr));
 	params.refcon = window.get();
 	params.drawWindowFunc = draw_window;
 	params.handleMouseClickFunc = mouse_click;
@@ -706,8 +756,6 @@ extern "C" int XLuaCreateImguiWindow(lua_State * L)
 	{
 		if(window->draw_ref != LUA_NOREF)
 			luaL_unref(L, LUA_REGISTRYINDEX, window->draw_ref);
-		if(created_context)
-			states.erase(L);
 		lua_pushnil(L);
 		return 1;
 	}
@@ -716,6 +764,10 @@ extern "C" int XLuaCreateImguiWindow(lua_State * L)
 	{
 		XPLMRegisterFlightLoopCallback(texture_tick, -1.0f, nullptr);
 		texture_loop_registered = true;
+	}
+	else if(!texture_loop_running)
+	{
+		XPLMSetFlightLoopCallbackInterval(texture_tick, -1.0f, 1, nullptr);
 	}
 	Make_XPLMWindowID(L, id);
 	return 1;
@@ -748,10 +800,7 @@ void xtlua2_imgui_cleanup_state(lua_State * L)
 		++it;
 		destroy_window(id);
 	}
-	auto context = states.find(L);
-	if(context != states.end())
-		states.erase(context);
-	if(windows.empty() && texture_loop_registered)
+	if(windows.empty() && texture_loop_registered && !texture_loop_running)
 	{
 		XPLMUnregisterFlightLoopCallback(texture_tick, nullptr);
 		texture_loop_registered = false;

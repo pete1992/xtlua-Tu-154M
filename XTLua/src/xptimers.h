@@ -32,6 +32,7 @@ int				xtlua_is_timer_scheduled(xlua_timer * t);
 double			xtlua_get_timer_remaining(xlua_timer * t);
 void xlua_do_timers_for_time(double now,bool isPaused);
 void xtlua_do_timers_for_time(double now,bool isPaused);
+bool xlua_is_main_timer_dispatch_active(); // Main-thread lifecycle/reentrancy guard.
 void xtlua_timer_cleanup();
 double xlua_get_simulated_time();
 

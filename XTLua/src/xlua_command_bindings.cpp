@@ -27,6 +27,7 @@ extern "C" {
 }
 
 #include <vector>
+#include <algorithm>
 
 // Defined in the generated XPLMUtilities_glue.cpp, which every build that compiles
 // this file also compiles.
@@ -57,29 +58,22 @@ struct cmd_binding {
 // registrations made through the copy of the thunk it shares a TU with.
 std::vector<cmd_binding> s_bindings;
 
-// Resolve the traceback handler for fmt_pcall_stdvars from the shared __debug_proc
-// global that both loaders plant. Same helper as xptimers.cpp / the imgui window
-// helpers - kept local so this file stays free of the module.h dependency, which
-// would lock it to the xlua.xpl per-aircraft context (the host's glua does not
-// compile module.cpp).
-int find_debug_proc(lua_State* L)
-{
-	lua_getglobal(L, "__debug_proc");
-	int v = 0;
-	if (lua_isuserdata(L, -1))
-	{
-		if (int* p = static_cast<int*>(lua_touserdata(L, -1))) v = *p;
-	}
-	lua_pop(L, 1);
-	return v;
-}
-
-// The C thunk XPLM calls. Mirrors the body the codegen used to emit for this
-// callback type, except for find_debug_proc (see above).
+// The C thunk XPLM calls. Keep the error handler on this invocation's stack:
+// a synchronous nested command need not share the loader's stack indexes.
 int xlua_command_handler(XPLMCommandRef inCommand, XPLMCommandPhase inPhase, void* inRefcon)
 {
-	int res = {};
-	notify_cb_t const* inRefcon_cb = static_cast<notify_cb_t*>(inRefcon);
+	// An unavailable/disabled interpreter must not swallow a simulator command.
+	// Also retain the record across Lua: a handler may unregister itself, which
+	// removes the registry's and s_bindings' ownership before this thunk returns.
+	int res = 1;
+	const auto binding = std::find_if(s_bindings.begin(), s_bindings.end(),
+		[inRefcon](const cmd_binding& candidate) {
+			return candidate.cb.get() == inRefcon;
+		});
+	if(binding == s_bindings.end())
+		return res;
+	const std::shared_ptr<notify_cb_t> callback = binding->cb;
+	notify_cb_t const* inRefcon_cb = callback.get();
 
 	lua_State* L = setup_lua_callback(inRefcon_cb, kCommandCallbackSig);
 	if (L)
@@ -87,9 +81,12 @@ int xlua_command_handler(XPLMCommandRef inCommand, XPLMCommandPhase inPhase, voi
 		Make_XPLMCommandRef(L, inCommand);
 		int inCommand_typed_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-		if (0 == fmt_pcall_stdvars(L, find_debug_proc(L), true, "rir", inCommand_typed_ref, inPhase, inRefcon_cb->get_capture()))
+		if (0 == fmt_pcall_stdvars(L, 0, true, "rir", inCommand_typed_ref, inPhase, inRefcon_cb->get_capture()))
 		{
-			res = lua_toboolean(L, -1) ? 1 : 0;
+			if(lua_isboolean(L, -1))
+				res = lua_toboolean(L, -1) ? 1 : 0;
+			else
+				log_message(L, "command callback must return a boolean; command passed through\n");
 			lua_pop(L, 1);
 		}
 		luaL_unref(L, LUA_REGISTRYINDEX, inCommand_typed_ref);
@@ -142,9 +139,9 @@ extern "C" int XLuaRegisterCommandHandler(lua_State* L)
 		inComand = xlua_checkuserdata<XPLMCommandRef>(L, 1, "Expected XPLMCommandRef");
 	}
 
-	// Validate the plain scalar first. The codegen emitted this check last purely
-	// because of the order its parameter loop runs in; doing it up front means a bad
-	// call cannot leave a pinned userref behind when luaL_checktype longjmps out.
+	// Validate all throwing arguments before pinning anything. luaL_checktype
+	// longjmps rather than unwinding a local shared_ptr in the LuaJIT build.
+	luaL_checktype(L, 2, LUA_TFUNCTION);
 	bool const inBefore = xlua_checkboolean(L, 3);
 
 	std::shared_ptr<notify_cb_t> cb_capture_0 = capture_lua_value(L, 4);
@@ -178,9 +175,12 @@ extern "C" int XLuaUnregisterCommandHandler(lua_State* L)
 		if (!binding_matches_args(L, *it, 2, 4))
 			continue;
 
-		XPLMUnregisterCommandHandler(inComand, xlua_command_handler, inBefore, it->cb.get());
-		xlua_remove_callback(it->cb);
+		// Detach before crossing into the SDK so a synchronous reentry cannot
+		// invalidate our iterator or unregister the same association twice.
+		const std::shared_ptr<notify_cb_t> callback = it->cb;
 		s_bindings.erase(it);
+		XPLMUnregisterCommandHandler(inComand, xlua_command_handler, inBefore, callback.get());
+		xlua_remove_callback(callback);
 		return 0;
 	}
 
@@ -193,21 +193,26 @@ extern "C" int XLuaUnregisterCommandHandler(lua_State* L)
 
 void xlua_command_bindings_cleanup(lua_State* L)
 {
-	// Unregistering here is the point, not housekeeping. A plugin unload would have
-	// XPLMCommandCleanupHook scrub these by plugin ID, but a plain disable/enable
-	// does not - and the notify_cb_t each refcon points at is freed by
-	// xlua_callback_cleanup immediately after this returns. Leaving the registration
-	// in place would hand the next dispatch a dangling refcon.
+	// Take an owned batch before SDK calls. Other modules keep their handlers;
+	// this state's handlers cannot be rediscovered by a reentrant cleanup.
+	std::vector<cmd_binding> retiring;
 	for (auto it = s_bindings.begin(); it != s_bindings.end(); )
 	{
 		if (it->L == L)
 		{
-			XPLMUnregisterCommandHandler(it->cmd, xlua_command_handler, it->before, it->cb.get());
+			retiring.push_back(*it);
 			it = s_bindings.erase(it);
 		}
 		else
 		{
 			++it;
 		}
+	}
+	for (const cmd_binding& binding : retiring)
+	{
+		XPLMUnregisterCommandHandler(binding.cmd, xlua_command_handler,
+			binding.before, binding.cb.get());
+		// Unregistered refcons no longer need the generic SDK callback quarantine.
+		xlua_remove_callback(binding.cb);
 	}
 }

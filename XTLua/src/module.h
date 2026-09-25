@@ -86,7 +86,18 @@ public:
 	bool is_xlua2() const { return m_runtime == module_runtime::xlua2_main; }
 	module_runtime get_runtime() const { return m_runtime; }
 	bool is_enabled() const { return m_enabled; }
+	bool is_closing() const { return m_closing; }
+	// A synchronous SDK callback is legal during chunk/Start/Enable/Stop work
+	// even when asynchronous callbacks are not yet (or no longer) enabled.
+	bool accepts_sdk_callbacks() const { return !m_closing && (m_enabled || m_sdk_call_depth != 0); }
+	void enter_sdk_call() { ++m_sdk_call_depth; }
+	void leave_sdk_call() { --m_sdk_call_depth; }
 	const string& get_script_path() const { return m_script_path; }
+
+	// After unload hooks and worker quiescence, close the classic binding gate
+	// before retiring DataRef/command/timer handles. Lua __gc still runs during
+	// lua_close(), but cannot access retired handles or create new bridge work.
+	void prepare_shutdown();
 
 	// XLua 2 plug-in lifecycle. These are meaningful only for xlua2_main;
 	// other runtimes are driven by the normal XTLua callout path below.
@@ -127,6 +138,8 @@ private:
 	module_runtime m_runtime;
 	bool m_started;
 	bool m_enabled;
+	bool m_closing;
+	unsigned m_sdk_call_depth = 0; // xlua2_main only, unwound around protected Lua calls.
 
 	void shutdown_lua();
 

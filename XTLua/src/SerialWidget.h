@@ -1,8 +1,9 @@
-#include "XPWidgets.h"
-#include <string>
-#include "json/json.hpp"
+#ifndef XTLUA_SERIAL_WIDGET_H
+#define XTLUA_SERIAL_WIDGET_H
 
-using nlohmann::json;
+#include "XPWidgets.h"
+#include <cstdint>
+#include <string>
  class SerialWidget
 {
 private:
@@ -11,7 +12,10 @@ private:
     int y=500;
     int w=350;
     int h=100;
-    json windowsettings;
+    std::string dataref_name;
+    std::string window_title;
+    std::string activation_key;
+    uint64_t settings_generation = 0;
     
     /*static int	SettingsWidgetsHandler(
 						XPWidgetMessage			inMessage,
@@ -21,11 +25,15 @@ private:
 public:
     
     SerialWidget();
-    void init(std::string value);
+    void init(const std::string& value);
     void show();
-    std::string getdRef();
-    std::string getTitle();
-    std::string getKey();
+    // Main-thread lifecycle cleanup, before the host plug-in/state is retired.
+    void cleanup();
+    const std::string& getdRef() const;
+    const std::string& getTitle() const;
+    const std::string& getKey() const;
 };
 
-static SerialWidget serialWindow;
+extern SerialWidget serialWindow;
+
+#endif

@@ -15,6 +15,7 @@ struct	xtlua_cmd;
 struct	xlua_cmd;
 typedef void (* xtlua_cmd_handler_f)(xtlua_cmd * cmd, int phase, float duration, void * ref);
 typedef void (* xlua_cmd_handler_f)(xlua_cmd * cmd, int phase, float duration, void * ref);
+typedef bool (* xlua_cmd_filter_f)(xlua_cmd * cmd, void * ref);
 xtlua_cmd * xtlua_find_cmd(const char * name);
 xlua_cmd * xlua_find_cmd(const char * name);
 xlua_cmd * xlua_create_cmd(const char * name, const char * desc);
@@ -23,6 +24,12 @@ xlua_cmd * xlua_create_cmd(const char * name, const char * desc);
 // command. The pre/post handlers always augment.
 void xtlua_cmd_install_handler(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref);
 void xlua_cmd_install_handler(xlua_cmd * cmd, xlua_cmd_handler_f handler, void * ref);
+void xlua_cmd_install_pre_wrapper(xlua_cmd * cmd, xlua_cmd_handler_f handler, void * ref);
+void xlua_cmd_install_post_wrapper(xlua_cmd * cmd, xlua_cmd_handler_f handler, void * ref);
+// Main thread only: the decision is latched from the first Begin to the final End.
+void xlua_cmd_install_filter(xlua_cmd * cmd, xlua_cmd_filter_f filter, void * ref);
+// Main-thread callbacks may call other commands, but not recursively execute this one.
+bool xlua_cmd_is_dispatching(xlua_cmd * cmd);
 void xtlua_cmd_install_pre_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref);
 void xtlua_cmd_install_post_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, void * ref);
 

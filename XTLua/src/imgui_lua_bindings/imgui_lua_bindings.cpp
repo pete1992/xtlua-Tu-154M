@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <imgui.h>
 #include <deque>
+#include <cfloat>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include "../xtlua2_imgui.h"
 
 extern "C" {
@@ -8,6 +12,435 @@ extern "C" {
   #include "lualib.h"
   #include "lauxlib.h"
 }
+
+namespace {
+
+// Explicit adapters for public ImGui 1.92 signatures which the historical
+// generator skips (new flag typedefs, ImVec2 defaults and integer returns).
+// They do not expose context/frame lifetime, native pointers or callbacks.
+void require_draw_frame(lua_State* L)
+{
+  if (!xtlua2_imgui_frame_active(L))
+    luaL_error(L, "imgui functions require an active xlua2_main draw callback");
+}
+
+float opt_float(lua_State* L, int index, float fallback)
+{
+  const lua_Number value = luaL_optnumber(L, index, fallback);
+  if (!std::isfinite(value) || value < -FLT_MAX || value > FLT_MAX)
+    luaL_argerror(L, index, "expected finite float-range number");
+  return static_cast<float>(value);
+}
+
+float check_float(lua_State* L, int index)
+{
+  luaL_checknumber(L, index);
+  return opt_float(L, index, 0);
+}
+
+int opt_int(lua_State* L, int index, int fallback = 0)
+{
+  const lua_Integer value = luaL_optinteger(L, index, fallback);
+  if (value < (std::numeric_limits<int>::min)() ||
+      value > (std::numeric_limits<int>::max)())
+    luaL_argerror(L, index, "expected int-range value");
+  return static_cast<int>(value);
+}
+
+int check_int(lua_State* L, int index)
+{
+  luaL_checkinteger(L, index);
+  return opt_int(L, index);
+}
+
+const char* numeric_format(lua_State* L, int index, const char* fallback,
+  bool floating_point)
+{
+  size_t length = 0;
+  const char* format = luaL_optlstring(L, index, fallback, &length);
+  if (length > 256 || std::memchr(format, '\0', length) != nullptr)
+    luaL_argerror(L, index, "numeric format must be at most 256 bytes without NUL");
+  unsigned conversions = 0;
+  for (size_t cursor = 0; cursor < length; )
+  {
+    if (format[cursor++] != '%')
+      continue;
+    if (cursor < length && format[cursor] == '%')
+    {
+      ++cursor;
+      continue;
+    }
+    if (++conversions != 1)
+      luaL_argerror(L, index, "numeric format requires one conversion");
+    while (cursor < length && std::strchr("-+ #0", format[cursor]) != nullptr)
+      ++cursor;
+    unsigned width = 0;
+    while (cursor < length && format[cursor] >= '0' && format[cursor] <= '9')
+    {
+      width = width * 10 + static_cast<unsigned>(format[cursor++] - '0');
+      if (width > 128)
+        luaL_argerror(L, index, "numeric format width exceeds 128");
+    }
+    if (cursor < length && format[cursor] == '.')
+    {
+      ++cursor;
+      unsigned precision = 0;
+      while (cursor < length && format[cursor] >= '0' && format[cursor] <= '9')
+      {
+        precision = precision * 10 + static_cast<unsigned>(format[cursor++] - '0');
+        if (precision > 32)
+          luaL_argerror(L, index, "numeric format precision exceeds 32");
+      }
+    }
+    // Reject *, positional arguments, length modifiers and pointer/string/%n
+    // conversions: ImGui supplies exactly one promoted float or 32-bit integer.
+    const char* allowed = floating_point ? "aAeEfFgG" : "diouxX";
+    if (cursor == length || std::strchr(allowed, format[cursor]) == nullptr)
+      luaL_argerror(L, index, "numeric format has an incompatible conversion");
+    ++cursor;
+  }
+  if (conversions != 1)
+    luaL_argerror(L, index, "numeric format requires one conversion");
+  return format;
+}
+
+void check_float_slider_range(lua_State* L, float minimum, float maximum)
+{
+  if (minimum > maximum)
+    luaL_argerror(L, 3, "slider minimum must not exceed maximum");
+  if (minimum < -FLT_MAX / 2.0f || maximum > FLT_MAX / 2.0f)
+    luaL_argerror(L, 3, "slider bounds exceed ImGui's float half-range");
+}
+
+void check_int_slider_range(lua_State* L, int minimum, int maximum)
+{
+  if (minimum > maximum)
+    luaL_argerror(L, 3, "slider minimum must not exceed maximum");
+  if (minimum < (std::numeric_limits<int>::min)() / 2 ||
+      maximum > (std::numeric_limits<int>::max)() / 2)
+    luaL_argerror(L, 3, "slider bounds exceed ImGui's integer half-range");
+}
+
+int numeric_input_flags(lua_State* L, int index)
+{
+  const int flags = opt_int(L, index);
+  if ((flags & (ImGuiInputTextFlags_CallbackCompletion |
+      ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CallbackAlways |
+      ImGuiInputTextFlags_CallbackCharFilter | ImGuiInputTextFlags_CallbackResize |
+      ImGuiInputTextFlags_CallbackEdit)) != 0)
+    luaL_argerror(L, index, "callback flags are not supported for numeric input");
+  return flags;
+}
+
+int push_bool(lua_State* L, bool value)
+{
+  lua_pushboolean(L, value);
+  return 1;
+}
+
+int extra_BeginChild(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* id = luaL_checkstring(L, 1);
+  return push_bool(L, ImGui::BeginChild(id,
+    ImVec2(opt_float(L, 2, 0), opt_float(L, 3, 0)),
+    opt_int(L, 4), opt_int(L, 5)));
+}
+
+int extra_SetNextWindowPos(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::SetNextWindowPos(ImVec2(check_float(L, 1),
+    check_float(L, 2)), opt_int(L, 3),
+    ImVec2(opt_float(L, 4, 0), opt_float(L, 5, 0)));
+  return 0;
+}
+
+int extra_SetNextWindowSize(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::SetNextWindowSize(ImVec2(check_float(L, 1),
+    check_float(L, 2)), opt_int(L, 3));
+  return 0;
+}
+
+int extra_SetNextWindowCollapsed(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::SetNextWindowCollapsed(lua_toboolean(L, 1) != 0, opt_int(L, 2));
+  return 0;
+}
+
+int extra_BeginCombo(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::BeginCombo(luaL_checkstring(L, 1),
+    luaL_optstring(L, 2, ""), opt_int(L, 3)));
+}
+
+int extra_BeginListBox(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::BeginListBox(luaL_checkstring(L, 1),
+    ImVec2(opt_float(L, 2, 0), opt_float(L, 3, 0))));
+}
+
+int extra_Selectable(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::Selectable(luaL_checkstring(L, 1),
+    lua_toboolean(L, 2) != 0, opt_int(L, 3),
+    ImVec2(opt_float(L, 4, 0), opt_float(L, 5, 0))));
+}
+
+int extra_BeginTable(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* id = luaL_checkstring(L, 1);
+  const int columns = check_int(L, 2);
+  if (columns < 1 || columns >= 512)
+    return luaL_argerror(L, 2, "table must have 1..511 columns");
+  return push_bool(L, ImGui::BeginTable(id, columns, opt_int(L, 3),
+    ImVec2(opt_float(L, 4, 0), opt_float(L, 5, 0)), opt_float(L, 6, 0)));
+}
+
+int extra_TableNextRow(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::TableNextRow(opt_int(L, 1), opt_float(L, 2, 0));
+  return 0;
+}
+
+int extra_TableSetupColumn(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::TableSetupColumn(luaL_checkstring(L, 1), opt_int(L, 2),
+    opt_float(L, 3, 0), static_cast<ImGuiID>(luaL_optinteger(L, 4, 0)));
+  return 0;
+}
+
+int extra_BeginTabBar(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::BeginTabBar(luaL_checkstring(L, 1), opt_int(L, 2)));
+}
+
+int extra_BeginTabItem(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  const bool has_open = !lua_isnoneornil(L, 2);
+  bool open = lua_toboolean(L, 2) != 0;
+  const bool selected = ImGui::BeginTabItem(label,
+    has_open ? &open : nullptr, opt_int(L, 3));
+  lua_pushboolean(L, selected);
+  if (has_open)
+    lua_pushboolean(L, open);
+  return has_open ? 2 : 1;
+}
+
+int extra_TreeNodeEx(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::TreeNodeEx(luaL_checkstring(L, 1), opt_int(L, 2)));
+}
+
+int extra_CollapsingHeader(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::CollapsingHeader(luaL_checkstring(L, 1), opt_int(L, 2)));
+}
+
+int extra_SetNextItemOpen(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::SetNextItemOpen(lua_toboolean(L, 1) != 0, opt_int(L, 2));
+  return 0;
+}
+
+int extra_DragFloat(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  float value = check_float(L, 2);
+  const char* format = numeric_format(L, 6, "%.3f", true);
+  const bool changed = ImGui::DragFloat(label, &value, opt_float(L, 3, 1),
+    opt_float(L, 4, 0), opt_float(L, 5, 0), format,
+    opt_int(L, 7));
+  lua_pushboolean(L, changed);
+  lua_pushnumber(L, value);
+  return 2;
+}
+
+int extra_DragInt(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  int value = check_int(L, 2);
+  const char* format = numeric_format(L, 6, "%d", false);
+  const bool changed = ImGui::DragInt(label, &value, opt_float(L, 3, 1),
+    opt_int(L, 4), opt_int(L, 5), format, opt_int(L, 7));
+  lua_pushboolean(L, changed);
+  lua_pushinteger(L, value);
+  return 2;
+}
+
+int extra_SliderFloat(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  float value = check_float(L, 2);
+  const float minimum = check_float(L, 3);
+  const float maximum = check_float(L, 4);
+  check_float_slider_range(L, minimum, maximum);
+  const char* format = numeric_format(L, 5, "%.3f", true);
+  const bool changed = ImGui::SliderFloat(label, &value, minimum, maximum,
+    format, opt_int(L, 6));
+  lua_pushboolean(L, changed);
+  lua_pushnumber(L, value);
+  return 2;
+}
+
+int extra_SliderInt(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  int value = check_int(L, 2);
+  const int minimum = check_int(L, 3);
+  const int maximum = check_int(L, 4);
+  check_int_slider_range(L, minimum, maximum);
+  const char* format = numeric_format(L, 5, "%d", false);
+  const bool changed = ImGui::SliderInt(label, &value, minimum, maximum,
+    format, opt_int(L, 6));
+  lua_pushboolean(L, changed);
+  lua_pushinteger(L, value);
+  return 2;
+}
+
+int extra_InputFloat(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  float value = check_float(L, 2);
+  const float step = opt_float(L, 3, 0);
+  const float fast_step = opt_float(L, 4, 0);
+  const char* format = numeric_format(L, 5, "%.3f", true);
+  const int flags = numeric_input_flags(L, 6);
+  const bool changed = ImGui::InputFloat(label, &value, step, fast_step,
+    format, flags);
+  lua_pushboolean(L, changed);
+  lua_pushnumber(L, value);
+  return 2;
+}
+
+int extra_InputInt(lua_State* L)
+{
+  require_draw_frame(L);
+  const char* label = luaL_checkstring(L, 1);
+  int value = check_int(L, 2);
+  const int step = opt_int(L, 3, 1);
+  const int fast_step = opt_int(L, 4, 100);
+  const int flags = numeric_input_flags(L, 5);
+  const bool changed = ImGui::InputInt(label, &value, step, fast_step, flags);
+  lua_pushboolean(L, changed);
+  lua_pushinteger(L, value);
+  return 2;
+}
+
+int extra_ProgressBar(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::ProgressBar(check_float(L, 1),
+    ImVec2(opt_float(L, 2, -FLT_MIN), opt_float(L, 3, 0)),
+    luaL_optstring(L, 4, nullptr));
+  return 0;
+}
+
+int extra_InvisibleButton(lua_State* L)
+{
+  require_draw_frame(L);
+  return push_bool(L, ImGui::InvisibleButton(luaL_checkstring(L, 1),
+    ImVec2(check_float(L, 2), check_float(L, 3)), opt_int(L, 4)));
+}
+
+#define XTLUA_IMGUI_FLAG_QUERY(name) \
+int extra_##name(lua_State* L) { \
+  require_draw_frame(L); \
+  return push_bool(L, ImGui::name(opt_int(L, 1))); \
+}
+XTLUA_IMGUI_FLAG_QUERY(IsWindowFocused)
+XTLUA_IMGUI_FLAG_QUERY(IsWindowHovered)
+XTLUA_IMGUI_FLAG_QUERY(IsItemHovered)
+#undef XTLUA_IMGUI_FLAG_QUERY
+
+#define XTLUA_IMGUI_INTEGER_QUERY(name) \
+int extra_##name(lua_State* L) { \
+  require_draw_frame(L); \
+  lua_pushinteger(L, ImGui::name()); \
+  return 1; \
+}
+XTLUA_IMGUI_INTEGER_QUERY(TableGetColumnCount)
+XTLUA_IMGUI_INTEGER_QUERY(TableGetColumnIndex)
+XTLUA_IMGUI_INTEGER_QUERY(TableGetRowIndex)
+#undef XTLUA_IMGUI_INTEGER_QUERY
+
+// Lua strings are text, not printf formats. A percent sign in a display label
+// must never request a missing C vararg. Use string.format() in Lua as needed.
+#define XTLUA_IMGUI_TEXT(name) \
+int extra_##name(lua_State* L) { \
+  require_draw_frame(L); \
+  ImGui::name("%s", luaL_checkstring(L, 1)); \
+  return 0; \
+}
+XTLUA_IMGUI_TEXT(Text)
+XTLUA_IMGUI_TEXT(TextDisabled)
+XTLUA_IMGUI_TEXT(TextWrapped)
+XTLUA_IMGUI_TEXT(BulletText)
+XTLUA_IMGUI_TEXT(SetTooltip)
+#undef XTLUA_IMGUI_TEXT
+
+int extra_LabelText(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::LabelText(luaL_checkstring(L, 1), "%s", luaL_checkstring(L, 2));
+  return 0;
+}
+
+int extra_TextColored(lua_State* L)
+{
+  require_draw_frame(L);
+  ImGui::TextColored(ImVec4(check_float(L, 1), check_float(L, 2),
+    check_float(L, 3), check_float(L, 4)), "%s", luaL_checkstring(L, 5));
+  return 0;
+}
+
+#define XTLUA_IMGUI_EXTRA(name) { #name, extra_##name }
+const luaL_Reg extra_imguilib[] = {
+  XTLUA_IMGUI_EXTRA(BeginChild),
+  XTLUA_IMGUI_EXTRA(SetNextWindowPos), XTLUA_IMGUI_EXTRA(SetNextWindowSize),
+  XTLUA_IMGUI_EXTRA(SetNextWindowCollapsed),
+  XTLUA_IMGUI_EXTRA(BeginCombo), XTLUA_IMGUI_EXTRA(BeginListBox),
+  XTLUA_IMGUI_EXTRA(Selectable), XTLUA_IMGUI_EXTRA(BeginTable),
+  XTLUA_IMGUI_EXTRA(TableNextRow), XTLUA_IMGUI_EXTRA(TableSetupColumn),
+  XTLUA_IMGUI_EXTRA(BeginTabBar), XTLUA_IMGUI_EXTRA(BeginTabItem),
+  XTLUA_IMGUI_EXTRA(TreeNodeEx), XTLUA_IMGUI_EXTRA(CollapsingHeader),
+  XTLUA_IMGUI_EXTRA(SetNextItemOpen),
+  XTLUA_IMGUI_EXTRA(DragFloat), XTLUA_IMGUI_EXTRA(DragInt),
+  XTLUA_IMGUI_EXTRA(SliderFloat), XTLUA_IMGUI_EXTRA(SliderInt),
+  XTLUA_IMGUI_EXTRA(InputFloat), XTLUA_IMGUI_EXTRA(InputInt),
+  XTLUA_IMGUI_EXTRA(ProgressBar), XTLUA_IMGUI_EXTRA(InvisibleButton),
+  XTLUA_IMGUI_EXTRA(IsWindowFocused), XTLUA_IMGUI_EXTRA(IsWindowHovered),
+  XTLUA_IMGUI_EXTRA(IsItemHovered), XTLUA_IMGUI_EXTRA(TableGetColumnCount),
+  XTLUA_IMGUI_EXTRA(TableGetColumnIndex), XTLUA_IMGUI_EXTRA(TableGetRowIndex),
+  XTLUA_IMGUI_EXTRA(Text), XTLUA_IMGUI_EXTRA(TextDisabled),
+  XTLUA_IMGUI_EXTRA(TextWrapped), XTLUA_IMGUI_EXTRA(BulletText),
+  XTLUA_IMGUI_EXTRA(SetTooltip), XTLUA_IMGUI_EXTRA(LabelText),
+  XTLUA_IMGUI_EXTRA(TextColored),
+  { nullptr, nullptr }
+};
+#undef XTLUA_IMGUI_EXTRA
+
+} // namespace
 
 
 // THIS IS FOR LUA 5.3 although you can make a few changes for other versions
@@ -44,6 +477,7 @@ static void ImEndStack(int type);
 const char * RunString(const char* szLua) {
   if (!lState) {
     fprintf(stderr, "You didn't assign the global lState, either assign that or refactor LoadImguiBindings and RunString\n");
+    return "RunString requires an assigned Lua state";
   }
 
   int iStatus = luaL_loadstring(lState, szLua);
@@ -507,6 +941,7 @@ static void PushImguiEnums(lua_State* lState, const char* tableName) {
 void LoadImguiBindings(lua_State* L) {
   lua_newtable(L);
   luaL_setfuncs(L, imguilib, 0);
+  luaL_setfuncs(L, extra_imguilib, 0);
   // The host owns frame lifetime. Letting Lua call EndFrame() here would
   // invalidate the frame before the panel draw callback renders it.
   lua_pushnil(L);

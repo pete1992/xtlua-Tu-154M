@@ -21,6 +21,7 @@
 #include "xpcommands.h"
 #include "xptimers.h"
 #include "module.h"
+#include "shared_xpfuncs.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -44,6 +45,7 @@
 struct xtlua_notify_cb_t {
 	lua_State *		L;
 	int				slot;
+	module *		owner;
 };
 
 // Given an interp and a stack arg that is a lua function/closure,
@@ -77,6 +79,7 @@ xtlua_notify_cb_t * wrap_lua_func(lua_State * L, int idx)
 		return NULL;
 	}
 	cb->L = L;
+	cb->owner = me;
 	lua_pushvalue (L, idx);
 	cb->slot = luaL_ref(L, LUA_REGISTRYINDEX);		
 	return cb;
@@ -100,6 +103,10 @@ lua_State * setup_lua_callback(void * ref)
 	if(ref == NULL) 
 		return NULL;
 	xtlua_notify_cb_t * cb = (xtlua_notify_cb_t *) ref;
+	// Constructor-failure teardown may already have closed cb->L while its
+	// module and tracked callback record remain alive until host cleanup.
+	if(cb->owner == NULL || cb->owner->is_closing())
+		return NULL;
 	lua_rawgeti (cb->L, LUA_REGISTRYINDEX, cb->slot);
 	if(!lua_isfunction(cb->L, -1))
 	{
@@ -125,6 +132,14 @@ static int luaL_check_array_index(lua_State * L, int narg)
 	if(!std::isfinite(value) || value < 0.0 || value > INT_MAX || std::floor(value) != value)
 		return luaL_argerror(L, narg, "array index must be a non-negative integer");
 	return static_cast<int>(value);
+}
+
+static double luaL_check_finite_time(lua_State * L, int narg)
+{
+	const double value = luaL_checknumber(L, narg);
+	if(!std::isfinite(value))
+		luaL_argerror(L, narg, "timer delay/repeat must be finite");
+	return value;
 }
 
 //----------------------------------------------------------------
@@ -181,7 +196,7 @@ static void xlua_notify_helper(xlua_dref * who, void * ref)
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
-		fmt_pcall_stdvars(L,module::debug_proc_from_interp(L),"");
+		fmt_pcall_stdvars(L, 0, "");
 	}
 }
 
@@ -375,78 +390,116 @@ static int XTLuaSetArray(lua_State * L)
 	return 0;		
 }
 
-static int XTLuaGetArrayLength(lua_State * L)
+static int array_length(xtlua_dref * d) { return xtlua_dref_get_dim(d); }
+static int array_length(xlua_dref * d) { return xlua_dref_get_dim(d); }
+static xtlua_dref_type array_type(xtlua_dref * d) { return xtlua_dref_get_type(d); }
+static xtlua_dref_type array_type(xlua_dref * d) { return xlua_dref_get_type(d); }
+static std::vector<double> array_read(xtlua_dref * d, int offset, int count)
+{ return xtlua_dref_get_array_values(d, offset, count); }
+static std::vector<double> array_read(xlua_dref * d, int offset, int count)
+{ return xlua_dref_get_array_values(d, offset, count); }
+static int array_write(xtlua_dref * d, const std::vector<double>& values, int offset)
+{ return xtlua_dref_set_array_values(d, values, offset); }
+static int array_write(xlua_dref * d, const std::vector<double>& values, int offset)
+{ return xlua_dref_set_array_values(d, values, offset); }
+
+template <typename Dref>
+static int get_array_length(lua_State * L)
 {
-	xtlua_dref * d = luaL_checkuserdata<xtlua_dref>(L, 1, "expected dataref");
-	if(xtlua_dref_get_type(d) != xlua_array)
+	Dref * d = luaL_checkuserdata<Dref>(L, 1, "expected dataref");
+	if(array_type(d) != xlua_array)
 		return luaL_argerror(L, 1, "expected array dataref");
-	lua_pushinteger(L, xtlua_dref_get_dim(d));
+	lua_pushinteger(L, array_length(d));
 	return 1;
 }
 
-// Block operations cross the worker bridge once; offsets use XPLM's zero-based convention.
-static int XTLuaGetArrayValues(lua_State * L)
+// Shared validation, separate C++ overloads: workers never select SDK functions.
+// Offsets are zero-based; Lua bulk value tables are dense and one-based.
+template <typename Dref>
+static int get_array_values(lua_State * L)
 {
-	xtlua_dref * d = luaL_checkuserdata<xtlua_dref>(L, 1, "expected dataref");
-	if(xtlua_dref_get_type(d) != xlua_array)
+	Dref * d = luaL_checkuserdata<Dref>(L, 1, "expected dataref");
+	if(array_type(d) != xlua_array)
 		return luaL_argerror(L, 1, "expected array dataref");
-	const int dim = xtlua_dref_get_dim(d);
+	const int dim = array_length(d);
 	const int offset = lua_isnoneornil(L, 2) ? 0 : luaL_check_array_index(L, 2);
 	if(offset > dim)
 		return luaL_argerror(L, 2, "array offset exceeds length");
 	const int count = lua_isnoneornil(L, 3) ? dim - offset : luaL_check_array_index(L, 3);
 	if(count > dim - offset)
 		return luaL_argerror(L, 3, "array range exceeds length");
-	const std::vector<double> values = xtlua_dref_get_array_values(d, offset, count);
-	if(values.size() != static_cast<size_t>(count))
-		return luaL_error(L, "array changed while reading worker snapshot");
-	lua_createtable(L, count, 0);
-	for(int i = 0; i < count; ++i)
+	bool complete = false;
 	{
-		lua_pushnumber(L, values[static_cast<size_t>(i)]);
-		lua_rawseti(L, -2, i + 1);
+		const std::vector<double> values = array_read(d, offset, count);
+		complete = values.size() == static_cast<size_t>(count);
+		if(complete)
+		{
+			lua_createtable(L, count, 0);
+			for(int i = 0; i < count; ++i)
+			{
+				lua_pushnumber(L, values[static_cast<size_t>(i)]);
+				lua_rawseti(L, -2, i + 1);
+			}
+		}
 	}
+	if(!complete)
+		return luaL_error(L, "array changed while reading snapshot");
 	return 1;
 }
 
-static int XTLuaSetArrayValues(lua_State * L)
+template <typename Dref>
+static int set_array_values(lua_State * L)
 {
-	xtlua_dref * d = luaL_checkuserdata<xtlua_dref>(L, 1, "expected dataref");
-	if(xtlua_dref_get_type(d) != xlua_array)
+	Dref * d = luaL_checkuserdata<Dref>(L, 1, "expected dataref");
+	if(array_type(d) != xlua_array)
 		return luaL_argerror(L, 1, "expected array dataref");
 	luaL_checktype(L, 2, LUA_TTABLE);
-	const int dim = xtlua_dref_get_dim(d);
+	const int dim = array_length(d);
 	const int offset = lua_isnoneornil(L, 3) ? 0 : luaL_check_array_index(L, 3);
 	if(offset > dim)
 		return luaL_argerror(L, 3, "array offset exceeds length");
 	const size_t count = lua_objlen(L, 2);
 	if(count > static_cast<size_t>(dim - offset))
 		return luaL_argerror(L, 2, "array range exceeds length");
+	// Validate everything before allocating the C++ vector: Lua's argument
+	// errors use longjmp and cannot unwind live standard-library containers.
+	size_t keys = 0;
 	lua_pushnil(L);
 	while(lua_next(L, 2) != 0)
 	{
-		if(lua_type(L, -2) != LUA_TNUMBER)
-			return luaL_argerror(L, 2, "array values must use sequential numeric keys");
+		if(lua_type(L, -2) != LUA_TNUMBER || lua_type(L, -1) != LUA_TNUMBER)
+			return luaL_argerror(L, 2, "array values must be a dense numeric sequence");
 		const double key = lua_tonumber(L, -2);
 		if(!std::isfinite(key) || key < 1.0 || key > static_cast<double>(count) || std::floor(key) != key)
 			return luaL_argerror(L, 2, "array values must use sequential numeric keys");
+		++keys;
 		lua_pop(L, 1);
 	}
-	std::vector<double> values;
-	values.reserve(count);
-	for(size_t i = 0; i < count; ++i)
+	if(keys != count)
+		return luaL_argerror(L, 2, "array values must be a dense numeric sequence");
+	int written = 0;
 	{
-		lua_rawgeti(L, 2, static_cast<int>(i + 1));
-		if(lua_type(L, -1) != LUA_TNUMBER)
-			return luaL_argerror(L, 2, "array values must be a dense numeric sequence");
-		values.push_back(lua_tonumber(L, -1));
-		lua_pop(L, 1);
+		std::vector<double> values(count);
+		for(size_t i = 0; i < count; ++i)
+		{
+			lua_rawgeti(L, 2, static_cast<int>(i + 1));
+			values[i] = lua_tonumber(L, -1);
+			lua_pop(L, 1);
+		}
+		written = array_write(d, values, offset);
 	}
-	if(xtlua_dref_set_array_values(d, values, offset) != static_cast<int>(count))
-		return luaL_error(L, "array changed while writing worker snapshot");
-	lua_pushinteger(L, static_cast<lua_Integer>(count));
+	if(written != static_cast<int>(count))
+		return luaL_error(L, "array changed while writing snapshot");
+	lua_pushinteger(L, written);
 	return 1;
 }
+
+static int XTLuaGetArrayLength(lua_State * L) { return get_array_length<xtlua_dref>(L); }
+static int XTLuaGetArrayValues(lua_State * L) { return get_array_values<xtlua_dref>(L); }
+static int XTLuaSetArrayValues(lua_State * L) { return set_array_values<xtlua_dref>(L); }
+static int XLuaGetArrayLength(lua_State * L) { return get_array_length<xlua_dref>(L); }
+static int XLuaGetArrayValues(lua_State * L) { return get_array_values<xlua_dref>(L); }
+static int XLuaSetArrayValues(lua_State * L) { return set_array_values<xlua_dref>(L); }
 static int XLuaGetArray(lua_State * L)
 {
 	xlua_dref * d = luaL_checkuserdata<xlua_dref>(L,1,"expected dataref");
@@ -550,7 +603,7 @@ static void cmd_cb_helper(xtlua_cmd * cmd, int phase, float elapsed, void * ref)
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
-		fmt_pcall_stdvars(L,module::debug_proc_from_interp(L),"if",phase, elapsed);
+		fmt_pcall_stdvars(L, 0, "if", phase, elapsed);
 	}
 }
 static void xlcmd_cb_helper(xlua_cmd * cmd, int phase, float elapsed, void * ref)
@@ -559,7 +612,7 @@ static void xlcmd_cb_helper(xlua_cmd * cmd, int phase, float elapsed, void * ref
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
-		fmt_pcall_stdvars(L,module::debug_proc_from_interp(L),"if",phase, elapsed);
+		fmt_pcall_stdvars(L, 0, "if", phase, elapsed);
 	}
 }
 // XPLMReplaceCommand cmd handler
@@ -573,6 +626,58 @@ static int XlLuaReplaceCommand(lua_State * L)
 	xlua_cmd_install_handler(d, xlcmd_cb_helper, cb);
 	return 0;	
 }
+
+static int XLuaReplaceCommand(lua_State * L)
+{
+	return XlLuaReplaceCommand(L); // Preserve the old misspelled binding as an alias.
+}
+
+static int XLuaWrapCommand(lua_State * L)
+{
+	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L, 1, "expected command");
+	// Validate both functions before persisting either callback.
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	luaL_checktype(L, 3, LUA_TFUNCTION);
+	xtlua_notify_cb_t * before = wrap_lua_func(L, 2);
+	xtlua_notify_cb_t * after = wrap_lua_func(L, 3);
+	xlua_cmd_install_pre_wrapper(d, xlcmd_cb_helper, before);
+	xlua_cmd_install_post_wrapper(d, xlcmd_cb_helper, after);
+	return 0;
+}
+
+static bool xlcmd_filter_helper(xlua_cmd *, void * ref)
+{
+	lua_State * L = setup_lua_callback(ref);
+	if(L == NULL)
+		return true;
+	// A filter must return synchronously. This helper is registered only by
+	// xtlua_main, never by xtlua_worker or its deferred command phase queue.
+	const int function_index = lua_gettop(L);
+	lua_pushtraceback(L);
+	lua_insert(L, function_index);
+	setup_std_vars(L, function_index);
+	const int result = lua_pcall(L, 0, 1, function_index);
+	const bool valid_result = result == 0 && lua_isboolean(L, -1);
+	const bool allowed = !valid_result || lua_toboolean(L, -1) != 0;
+	if(result != 0)
+	{
+		const char * message = lua_tostring(L, -1);
+		log_message(L, "command filter failed: %s\n", message ? message : "non-string error");
+	}
+	else if(!valid_result)
+		log_message(L, "command filter must return a boolean; command passed through\n");
+	lua_pop(L, 1);
+	lua_remove(L, function_index);
+	return allowed;
+}
+
+static int XLuaFilterCommand(lua_State * L)
+{
+	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L, 1, "expected command");
+	xtlua_notify_cb_t * callback = wrap_lua_func(L, 2);
+	xlua_cmd_install_filter(d, xlcmd_filter_helper, callback);
+	return 0;
+}
 static int XTLuaReplaceCommand(lua_State * L)
 {
 	xtlua_cmd * d = luaL_checkuserdata<xtlua_cmd>(L,1,"expected command");
@@ -585,6 +690,8 @@ static int XTLuaReplaceCommand(lua_State * L)
 static int XTLuaWrapCommand(lua_State * L)
 {
 	xtlua_cmd * d = luaL_checkuserdata<xtlua_cmd>(L,1,"expected command");
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	luaL_checktype(L, 3, LUA_TFUNCTION);
 	xtlua_notify_cb_t * cb1 = wrap_lua_func(L, 2);
 	xtlua_notify_cb_t * cb2 = wrap_lua_func(L, 3);
 	
@@ -620,6 +727,8 @@ static int XLuaCommandStart(lua_State * L)
 {
 	//printf("C++ command start");
 	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L,1,"expected command");
+	if(xlua_cmd_is_dispatching(d))
+		return luaL_error(L, "cannot recursively start the command currently being handled");
 	xlua_cmd_start(d);
 	return 0;
 }
@@ -628,6 +737,8 @@ static int XLuaCommandStart(lua_State * L)
 static int XLuaCommandStop(lua_State * L)
 {
 	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L,1,"expected command");
+	if(xlua_cmd_is_dispatching(d))
+		return luaL_error(L, "cannot recursively stop the command currently being handled");
 	xlua_cmd_stop(d);
 	return 0;
 }
@@ -636,6 +747,8 @@ static int XLuaCommandStop(lua_State * L)
 static int XLuaCommandOnce(lua_State * L)
 {
 	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L,1,"expected command");
+	if(xlua_cmd_is_dispatching(d))
+		return luaL_error(L, "cannot recursively invoke the command currently being handled");
 	xlua_cmd_once(d);
 	return 0;
 }
@@ -648,7 +761,7 @@ static void timer_cb(void * ref)
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
-		fmt_pcall_stdvars(L,module::debug_proc_from_interp(L),"");
+		fmt_pcall_stdvars(L, 0, "");
 	}	
 }
 
@@ -674,7 +787,9 @@ static int XTLuaRunTimer(lua_State * L)
 	if(!t)
 		return 0;
 	
-	xtlua_run_timer(t, luaL_checknumber(L, 2), luaL_checknumber(L, 3));
+	const double delay = luaL_check_finite_time(L, 2);
+	const double repeat = luaL_check_finite_time(L, 3);
+	xtlua_run_timer(t, delay, repeat);
 	return 0;
 }
 
@@ -707,7 +822,9 @@ static int XLuaRunTimer(lua_State * L)
 	if(!t)
 		return 0;
 	
-	xlua_run_timer(t, luaL_checknumber(L, 2), luaL_checknumber(L, 3));
+	const double delay = luaL_check_finite_time(L, 2);
+	const double repeat = luaL_check_finite_time(L, 3);
+	xlua_run_timer(t, delay, repeat);
 	return 0;
 }
 
@@ -720,6 +837,20 @@ static int XLuaIsTimerScheduled(lua_State * L)
 	return 1;
 }
 
+
+static int XTLuaGetTimerRemaining(lua_State * L)
+{
+	xlua_timer * t = luaL_checkuserdata<xlua_timer>(L, 1, "expected timer");
+	lua_pushnumber(L, xtlua_get_timer_remaining(t));
+	return 1;
+}
+
+static int XLuaGetTimerRemaining(lua_State * L)
+{
+	xlua_timer * t = luaL_checkuserdata<xlua_timer>(L, 1, "expected timer");
+	lua_pushnumber(L, xlua_get_timer_remaining(t));
+	return 1;
+}
 
 //FUNC(XLuaCreateDataRef) 
 #define XT_FUNC_LIST \
@@ -743,6 +874,7 @@ static int XLuaIsTimerScheduled(lua_State * L)
 	FUNC(XTLuaCommandOnce) \
 	FUNC(XTLuaCreateTimer) \
 	FUNC(XTLuaRunTimer) \
+	FUNC(XTLuaGetTimerRemaining) \
 	FUNC(XTLuaIsTimerScheduled)
 #define XL_FUNC_LIST \
 	FUNC(XLuaGetCode) \
@@ -752,28 +884,60 @@ static int XLuaIsTimerScheduled(lua_State * L)
 	FUNC(XLuaSetNumber) \
 	FUNC(XLuaGetArray) \
 	FUNC(XLuaSetArray) \
+	FUNC(XLuaGetArrayLength) \
+	FUNC(XLuaGetArrayValues) \
+	FUNC(XLuaSetArrayValues) \
 	FUNC(XLuaGetString) \
 	FUNC(XLuaSetString) \
 	FUNC(XLuaFindCommand) \
 	FUNC(XLuaCreateCommand) \
 	FUNC(XlLuaReplaceCommand) \
+	FUNC(XLuaReplaceCommand) \
+	FUNC(XLuaWrapCommand) \
+	FUNC(XLuaFilterCommand) \
 	FUNC(XLuaCommandStart) \
 	FUNC(XLuaCommandStop) \
 	FUNC(XLuaCommandOnce) \
 	FUNC(XLuaCreateTimer) \
 	FUNC(XLuaRunTimer) \
+	FUNC(XLuaGetTimerRemaining) \
 	FUNC(XLuaIsTimerScheduled) \
 	FUNC(XLuaCreateDataRef)\
 	FUNC(XLuaExistingDataRef)
 
+static int classic_binding_dispatch(lua_State * L)
+{
+	module * owner = module::module_from_interp(L);
+	if(owner == NULL)
+		return luaL_error(L, "module context unavailable");
+	if(owner->is_closing())
+		return luaL_error(L, "XTLua module is closing; classic bindings are unavailable");
+
+	// Keep a Lua C function value, not a function-pointer/object-pointer cast.
+	// The gate precedes every original binding, including handle validation:
+	// finalizers may still hold lightuserdata whose C++ object was retired.
+	lua_CFunction function = lua_tocfunction(L, lua_upvalueindex(1));
+	if(function == NULL)
+		return luaL_error(L, "XTLua classic binding target unavailable");
+	return function(L);
+}
+
+static void register_classic_binding(lua_State * L, const char * name, lua_CFunction function)
+{
+	lua_pushcfunction(L, function);
+	lua_pushcclosure(L, classic_binding_dispatch, 1);
+	lua_setglobal(L, name);
+}
+
 void	add_xpfuncs_to_interp(lua_State * L,bool isXT)
 {
 	#define FUNC(x) \
-		lua_register(L,#x,x);
+		register_classic_binding(L,#x,x);
 	if(isXT){	
 		XT_FUNC_LIST;
 	}
 	else{
 		XL_FUNC_LIST;
 	}
+	#undef FUNC
 }
