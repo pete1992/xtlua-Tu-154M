@@ -389,7 +389,7 @@ static xlua_timer * create_timer(xlua_timer *& head, xlua_timer_f func, void * r
 	for(xlua_timer * timer = head; timer; timer = timer->m_next)
 		if(timer->m_func == func && timer->m_ref == ref)
 		{
-			std::fprintf(stderr, "xtlua: ERROR: timer already exists.\n");
+			// The Lua binding reports this failure with its owning script name.
 			return NULL;
 		}
 	xlua_timer * timer = new xlua_timer;

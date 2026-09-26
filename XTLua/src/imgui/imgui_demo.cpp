@@ -2029,7 +2029,8 @@ static void DemoWindowWidgetsPlotting()
                 average += values[n];
             average /= (float)IM_COUNTOF(values);
             char overlay[32];
-            sprintf(overlay, "avg %f", average);
+            snprintf(overlay, sizeof(overlay), "avg %f", average);
+            overlay[sizeof(overlay) - 1] = '\0';
             ImGui::PlotLines("Lines", values, IM_COUNTOF(values), values_offset, overlay, -1.0f, 1.0f, ImVec2(0, 80.0f));
         }
 

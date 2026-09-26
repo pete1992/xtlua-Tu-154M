@@ -384,7 +384,6 @@ void ImgWindow::RenderImGui(ImDrawData *draw_data)
 		draw_data->ScaleClipRects(io.DisplayFramebufferScale);
 
 	updateMatrices();
-	//printf("hello 3\n");
 	// We are using the OpenGL fixed pipeline because messing with the
 	// shader-state in X-Plane is not very well documented, but using the fixed
 	// function pipeline is.
@@ -795,17 +794,14 @@ void ImgWindow::SetVisible(bool inIsVisible)
 		moveForVR();
 	/*if (GetVisible() == inIsVisible) {
 		// if the state is already correct, no-op.
-		printf("XTLua IMGUI: already inIsVisible\n");
 		return;
 	}
 	if (inIsVisible) {
 		if (!onShow()) {
-			printf("XTLua IMGUI: already onShow\n");
 			// chance to early abort.
 			return;
 		}
 	}*/
-	printf("XTLua IMGUI: XPLMSetWindowIsVisible\n");
 	XPLMSetWindowIsVisible(imguiWindowID, inIsVisible ? 1 : 0);
 }
 
@@ -813,22 +809,17 @@ void ImgWindow::moveForVR()
 {
 	// if we're trying to display the window, check the state of the VR flag
 	// - if we're VR enabled, explicitly move the window to the VR world.
-	printf("XTLua IMGUI: moveForVR\n");
 	if (XPLMGetDatai(gVrEnabledRef))
 	{
-		printf("XTLua IMGUI: moveForVR gVrEnabledRef\n");
 		XPLMSetWindowPositioningMode(imguiWindowID, xplm_WindowVR, 0);
 	}
 	else
 	{
-		printf("XTLua IMGUI: check IsInVR\n");
 		if (IsInVR())
 		{
-			printf("XTLua IMGUI: IsInVR\n");
 			XPLMSetWindowPositioningMode(imguiWindowID, mPreferredLayer, -1);
 		}
 	}
-	printf("XTLua IMGUI: leave moveForVR\n");
 }
 
 bool ImgWindow::GetVisible() const

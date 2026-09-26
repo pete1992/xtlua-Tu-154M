@@ -37,8 +37,9 @@ private:
 	static int s_nil_ref_count;
 };
 
-std::string get_log_prefix(char level = 'I');
 std::filesystem::path get_current_script_path(lua_State * L);
+// Error-only entry point; supply the Lua state whenever a script is involved.
+// No message text is inspected to decide severity.
 int log_message(lua_State * L, const char * format, ...);
 
 // All Lua runtimes enqueue owned text; enqueue never calls XPLM or touches a

@@ -57,21 +57,17 @@ ImgWindow* AddWindow (void (*guiFunc)(void))
 {
     int left, top, right, bottom;
     CalcWinCoords(left, top, right, bottom);
-    XPLMDebugString("XTLua: AddWindow\n");
     XPLMWindowDecoration decoration = xplm_WindowDecorationSelfDecoratedResizable;
     XPLMWindowLayer layer = xplm_WindowLayerFloatingWindows; 
     // This creates a ImguiWidget object inside the list,
     // which in turn creates the actual window through its constructor
-    XPLMDebugString("XTLua: make_shared\n");
     /*std::shared_ptr<ImguiWidget> window=std::make_shared<ImguiWidget>(left, top, right, bottom,
                                                         decoration,
                                                         layer,guiFunc);*/
     ImguiWidget*  window = new  ImguiWidget(left, top, right, bottom,
                                                         decoration,
                                                         layer,guiFunc);                                            
-    XPLMDebugString("XTLua: begin emplace_backd\n");
     gWndList.emplace_back(window);
-    XPLMDebugString("XTLua: Log window emplace_back\n");
     return window;
 }
 
@@ -89,7 +85,6 @@ void IMGGUIXPluginDisable(void) {
     
     // Cleanup the general stuff
     //cleanupAfterImgWindow();
-    printf("IMGGUIXPluginDisable completed\n");
 }
 
 int IMGGUIXPluginEnable(void) {

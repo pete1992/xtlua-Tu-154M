@@ -110,7 +110,7 @@ lua_State * setup_lua_callback(void * ref)
 	lua_rawgeti (cb->L, LUA_REGISTRYINDEX, cb->slot);
 	if(!lua_isfunction(cb->L, -1))
 	{
-		printf("ERROR: we did not persist a closure?!?");
+		log_message(cb->L, "callback no longer resolves to its persisted function\n");
 		lua_pop(cb->L, 1);
 		return 0;
 	}
@@ -159,7 +159,7 @@ static int XLuaGetCode(lua_State * L)
 	if(result)
 	{
 		const char * err_msg = luaL_checkstring(L,-1);
-		printf("%s: %s", name, err_msg);
+		log_message(L, "cannot load %s: %s\n", name, err_msg);
 	}
 	
 	return 1;
@@ -345,11 +345,9 @@ static int XLuaExistingDataRef(lua_State * L)
 	const char * s = luaL_checkstring(L, 1);
 	XPLMDataRef dRefcheckother = XPLMFindDataRef(s);
     if(!dRefcheckother){
-        printf("no %s\n",s);
 		lua_pushnumber(L, 0);
 	}
     else {
-        printf("existing %s\n",s); 
 		lua_pushnumber(L, 1);
 	}
     return 1;
@@ -599,7 +597,6 @@ static int XLuaCreateCommand(lua_State * L)
 
 static void cmd_cb_helper(xtlua_cmd * cmd, int phase, float elapsed, void * ref)
 {
-	//printf("xtcmd_cb_helper\n");
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
@@ -608,7 +605,6 @@ static void cmd_cb_helper(xtlua_cmd * cmd, int phase, float elapsed, void * ref)
 }
 static void xlcmd_cb_helper(xlua_cmd * cmd, int phase, float elapsed, void * ref)
 {
-	//printf("xlcmd_cb_helper\n");
 	lua_State * L = setup_lua_callback(ref);
 	if(L)
 	{
@@ -725,7 +721,6 @@ static int XTLuaCommandOnce(lua_State * L)
 }
 static int XLuaCommandStart(lua_State * L)
 {
-	//printf("C++ command start");
 	xlua_cmd * d = luaL_checkuserdata<xlua_cmd>(L,1,"expected command");
 	if(xlua_cmd_is_dispatching(d))
 		return luaL_error(L, "cannot recursively start the command currently being handled");

@@ -29,62 +29,6 @@ static char s_stdvars_runtime_registry_key;
 
 } // namespace
 
-#if 0
-int validate_args(lua_State * L, const char * fmt)
-{
-	if(strlen(fmt) != lua_gettop(L))
-	{
-		printf("Wrong numer of args: expected %d, got %d\n", (int) strlen(fmt), lua_gettop(L));
-		return 0;
-	}
-	
-	int i = 1;
-	while(*fmt)
-	{
-		switch(*fmt) {
-		case 's':
-			if (!lua_isstring(L, i))
-			{
-				printf("Argument %d should be a string.\n", i);
-				return 0;
-			}
-			break;
-		case 'n':
-			if (!lua_isnumber(L, i))
-			{
-				printf("Argument %d should be a number.\n", i);
-				return 0;
-			}
-			break;
-		case 't':
-			if (!lua_istable(L, i))
-			{
-				printf("Argument %d should be a table.\n", i);
-				return 0;
-			}
-			break;
-		case 'p':
-			if (!lua_islightuserdata(L, i))
-			{
-				printf("Argument %d should be a command or dataref.\n", i);
-				return 0;
-			}
-			break;
-		case 'f':
-			if (!lua_isfunction(L, i) && !lua_isnil(L, i))
-			{
-				printf("Argument %d should be a command or dataref.\n", i);
-				return 0;
-			}
-			break;		
-		}
-		++fmt;
-		++i;
-	}
-	
-	return 1;
-}
-#endif
 
 static int traceback(lua_State * L)
 {

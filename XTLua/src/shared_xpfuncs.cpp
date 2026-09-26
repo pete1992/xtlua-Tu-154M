@@ -11,7 +11,6 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 int notify_cb_t::s_nil_ref_count = -100;
@@ -50,8 +49,6 @@ namespace {
 // C++17-compatible ownership registry.  The raw pointer is exactly the refcon
 // handed to XPLM; the shared_ptr value keeps the Lua registry references alive.
 std::unordered_map<const notify_cb_t *, std::shared_ptr<notify_cb_t>> g_callbacks;
-std::unordered_map<lua_State *, size_t> g_callback_counts;
-std::unordered_set<lua_State *> g_callback_count_warned;
 
 // The queue owns only text. In particular, draining finalizer/unload messages
 // never dereferences a module or Lua state which has already been destroyed.
@@ -109,14 +106,6 @@ std::size_t xtlua_flush_log_queue()
 	return batch.size();
 }
 
-std::string get_log_prefix(char level)
-{
-	std::string prefix("XTLua ");
-	prefix.push_back(level);
-	prefix += ": ";
-	return prefix;
-}
-
 std::filesystem::path get_current_script_path(lua_State * L)
 {
 	module * owner = module::module_from_interp(L);
@@ -133,7 +122,7 @@ int log_message(lua_State * L, const char * format, ...)
 	va_end(args);
 	buffer[sizeof(buffer) - 1] = 0;
 
-	std::string output = get_log_prefix(L ? 'E' : 'I');
+	std::string output("XTLua: ERROR: ");
 	if(L)
 	{
 		module * owner = module::module_from_interp(L);
@@ -233,7 +222,7 @@ lua_State * setup_lua_callback(
 	if(callback->get_capture() != notify_cb_t::kNeverPersist &&
 		!xlua_is_callback_valid(callback))
 	{
-		log_message(nullptr,
+		log_message(callback->L,
 			"invalid callback '%s' was invoked after cleanup\n",
 			callback_key.c_str());
 		return nullptr;
@@ -268,17 +257,9 @@ void xlua_persist_userref(
 	if(!callback || callback->get_capture() == notify_cb_t::kNeverPersist)
 		return;
 
-	if(!g_callbacks.emplace(callback.get(), callback).second)
-		return;
-	const size_t live_for_state = ++g_callback_counts[L];
-	if(live_for_state > 500 && g_callback_count_warned.insert(L).second)
-	{
-		// Generated bindings can already own earlier captures/resources here.
-		// A hard luaL_error longjmp would skip their C++ destructors. Keep
-		// ownership valid and diagnose once; a true hard cap needs preflight
-		// across the entire generated binding, not one capture at a time.
-		log_message(L, "more than 500 live SDK callbacks; check resource cleanup\n");
-	}
+	// Callback count alone is not an error. Retain ownership without a
+	// diagnostic quota or a longjmp across already captured SDK resources.
+	g_callbacks.emplace(callback.get(), callback);
 }
 
 void xlua_remove_callback(std::shared_ptr<notify_cb_t> callback)
@@ -292,9 +273,6 @@ void xlua_remove_callback(const notify_cb_t * callback)
 	const auto found = g_callbacks.find(callback);
 	if(found == g_callbacks.end())
 		return;
-	const auto count = g_callback_counts.find(found->second->L);
-	if(count != g_callback_counts.end() && --count->second == 0)
-		g_callback_counts.erase(count);
 	g_callbacks.erase(found);
 }
 
@@ -305,8 +283,6 @@ bool xlua_is_callback_valid(const notify_cb_t * callback)
 
 void xlua_callback_cleanup(lua_State * L)
 {
-	g_callback_counts.erase(L);
-	g_callback_count_warned.erase(L);
 	for(auto& callback : g_callbacks)
 	{
 		if(callback.second && callback.second->L == L)
@@ -328,8 +304,6 @@ void xlua_callback_shutdown()
 			callback.second->L = nullptr;
 	}
 	g_callbacks.clear();
-	g_callback_counts.clear();
-	g_callback_count_warned.clear();
 }
 
 std::optional<std::string> xlua_checkoptstring(lua_State * L, int narg)

@@ -18,6 +18,7 @@
 #include <XPLMUtilities.h>
 //#include <XPLMProcessing.h>
 #include "xpdatarefs.h"
+#include "shared_xpfuncs.h"
 
 //#include <XPLMDataAccess.h>
 #include <XPLMPlugin.h>
@@ -44,8 +45,6 @@ using std::vector;
 #define STAT_PLUGIN_SIG "xplanesdk.examples.DataRefEditor"
 #endif
 
-//#define TRACE_DATAREFS printf
-#define TRACE_DATAREFS(...)
 
 static int xlua_round_to_int(double value)
 {
@@ -402,7 +401,6 @@ static void resolve_lua_dref(xlua_dref * d)
 			XPLMDataRef arr = XPLMFindDataRef(refname.c_str());				// Only if we have a valid name
 			if(arr)
 			{
-				printf("found arr dref %s",d->m_name.c_str());
 				XPLMDataTypeID tid = XPLMGetDataRefTypes(arr);
 				if(tid & (xplmType_FloatArray | xplmType_IntArray))			// AND are array type
 				{
@@ -511,29 +509,14 @@ static void resolve_xp_dref(xlua_dref * d)
 
 void			xlua_validate_drefs()
 {
+#if MOBILE
 	for(xtlua_dref * f : worker_drefs_snapshot())
-	{
-	#if MOBILE
 		assert(f->m_dref != NULL);
-	#else
-		if(f->m_dref == NULL)
-			printf("WARNING: xtlua dataref %s is used but not defined.\n", f->m_name.c_str());
-	#endif
-
-
-	}
 	for(xlua_dref * f = l_drefs; f; f = f->m_next)
-	{
-	#if MOBILE
 		assert(f->m_dref != NULL);
-	#else
-		if(f->m_dref == NULL)
-			printf("WARNING: xlua dataref %s is used but not defined.\n", f->m_name.c_str());
-	#endif
-	}
+#endif
+	// Unresolved/optional refs are retried by the bridge, not runtime errors.
 	xtluaDefs.refreshAllDataRefs();
-
-
 }
 
 xlua_dref *		xlua_find_dref(const char * name)
@@ -541,7 +524,6 @@ xlua_dref *		xlua_find_dref(const char * name)
 	for(xlua_dref * f = l_drefs; f; f = f->m_next)
 	if(f->m_name == name)
 	{
-		TRACE_DATAREFS("Found %s as %p\n", name,f);
 		return f;
 	}
 	// We have never tried to find this dref before - make a new record
@@ -559,7 +541,6 @@ xlua_dref *		xlua_find_dref(const char * name)
 	
 	resolve_lua_dref(d);
 
-	TRACE_DATAREFS("Speculating %s as %p\n", name,d);
 
 	return d;
 }
@@ -571,7 +552,6 @@ xtlua_dref *		xtlua_find_dref(const char * name)
 	for(xtlua_dref * f = s_drefs; f; f = f->m_next)
 	if(f->m_name == name)
 	{
-		TRACE_DATAREFS("Found %s as %p\n", name,f);
 		return f;
 	}
 	// We have never tried to find this dref before - make a new record
@@ -589,13 +569,11 @@ xtlua_dref *		xtlua_find_dref(const char * name)
 	
 	resolve_dref(d);
 
-	TRACE_DATAREFS("Speculating %s as %p\n", name,d);
 
 	return d;
 }
 xlua_dref *		xlua_create_dref(const char * name, xtlua_dref_type type, int dim, int writable, xlua_dref_notify_f func, void * ref)
 {
-	//printf("ERROR: xTLua cannot create datarefs - us xLua.\n");
 	//return NULL;
 	
 	assert(type != xlua_none);
@@ -610,23 +588,22 @@ xlua_dref *		xlua_create_dref(const char * name, xtlua_dref_type type, int dim, 
 	{
 		if(f->m_ours || f->m_dref)
 		{
-			printf("ERROR: %s is already a dataref.\n",name);
+			log_message(nullptr, "%s is already a dataref.\n",name);
 			return NULL;
 		}
-		TRACE_DATAREFS("Reusing %s as %p\n", name,f);		
 		break;
 	}
 	
 	if(n.find('[') != n.npos)
 	{
-		printf("ERROR: %s contains brackets in its name.\n", name);
+		log_message(nullptr, "%s contains brackets in its name.\n", name);
 		return NULL;
 	}
 	
 	XPLMDataRef other = XPLMFindDataRef(name);
 	if(other && XPLMIsDataRefGood(other))
 	{
-		printf("ERROR: %s is used by another plugin.\n", name);
+		log_message(nullptr, "%s is used by another plugin.\n", name);
 		return NULL;
 	}
 	
@@ -636,7 +613,6 @@ xlua_dref *		xlua_create_dref(const char * name, xtlua_dref_type type, int dim, 
 		d = new xlua_dref;
 		d->m_next = l_drefs;
 		l_drefs = d;
-		printf("Creating %s as %p\n", name,d);		
 	}
 	d->m_name = name;
 	d->m_index = -1;
@@ -658,7 +634,6 @@ xlua_dref *		xlua_create_dref(const char * name, xtlua_dref_type type, int dim, 
 						d, d);
 		break;
 	case xlua_array:
-		//printf("create array %s %d",name,dim);
 		d->m_types = xplmType_FloatArray|xplmType_IntArray;
 		d->m_dref = XPLMRegisterDataAccessor(name, d->m_types, writable,
 						NULL, NULL,
@@ -862,7 +837,6 @@ double			xlua_dref_get_array(xlua_dref * d, int n)
 		double retVal=0.0;
 		if(n < (int)d->m_array_storage.size())
 			retVal=d->m_array_storage[n];
-		//printf("get array %d=%f\n",n,retVal);	
 		xlua_data_mutex.unlock();
 		return retVal;
 	}
@@ -894,7 +868,6 @@ void			xlua_dref_set_array(xlua_dref * d, int n, double value)
 		if(n < (int)d->m_array_storage.size()){
 			if(value!=d->m_array_storage[n])
 				xlua_dref_changed(d);
-			//printf("set array %d=%f\n",n,value);	
 			d->m_array_storage[n] = value;
 		}
 		xlua_data_mutex.unlock();
@@ -1170,7 +1143,6 @@ void			xlua_relink_all_drefs()
 	if(dre != XPLM_NO_PLUGIN_ID)
 	if(!XPLMIsPluginEnabled(dre))
 	{
-		printf("WARNING: can't register drefs - DRE is not enabled.\n");
 		dre = XPLM_NO_PLUGIN_ID;
 	}
 #endif
@@ -1187,7 +1159,6 @@ void			xlua_relink_all_drefs()
 		if(d->m_ours)
 		if(dre != XPLM_NO_PLUGIN_ID)
 		{
-			//printf("registered: %s\n", d->m_name.c_str());
 			XPLMSendMessageToPlugin(dre, MSG_ADD_DATAREF, (void *)d->m_name.c_str());		
 		}		
 #endif
@@ -1203,7 +1174,6 @@ void			xlua_relink_all_drefs()
 		if(d->m_ours)
 		if(dre != XPLM_NO_PLUGIN_ID)
 		{
-			//printf("registered: %s\n", d->m_name.c_str());
 			XPLMSendMessageToPlugin(dre, MSG_ADD_DATAREF, (void *)d->m_name.c_str());		
 		}		
 #endif
@@ -1296,7 +1266,6 @@ std::vector<string> get_runMessages(){
 	return items;
 }
 void xlua_add_callout(string callout){
-	printf("xlua_add_callout %s\n",callout.c_str());
 	xtluaDefs.refreshAllDataRefs();
 	data_mutex.lock();
 	messageQueue.push_back(callout);
@@ -1385,7 +1354,6 @@ void xtlua_dref_cleanup()
 		std::lock_guard<std::mutex> lock(xlua_change_mutex);
 		changedDrefs.clear();
 	}
-	printf("XLua Cleanup\n");
 }
 
 //
@@ -1419,10 +1387,6 @@ xtlua_cmd * xtlua_find_cmd(const char * name)
 	if(i->m_name == name)
 		return i;
 		
-	/*XPLMCommandRef c = XPLMFindCommand(name);	
-	if(c == NULL){
-		printf("ERROR: Command %s not found\n",name);
-	} return NULL;*/	
 		
 	xtlua_cmd * nc = new xtlua_cmd;
 	nc->m_next = s_cmds;
@@ -1434,14 +1398,13 @@ xtlua_cmd * xtlua_find_cmd(const char * name)
 }
 xlua_cmd * xlua_find_cmd(const char * name)
 {
-	//printf("looking for %s\n",name);
 	for(xlua_cmd * i = l_cmds; i; i = i->m_next)
 	if(i->m_name == name)
 		return i;
 		
 	XPLMCommandRef c = XPLMFindCommand(name);	
 	if(c == NULL){
-		printf("ERROR: Command %s not found\n",name);
+		log_message(nullptr, "Command %s not found\n",name);
 	} 
 	if(c == NULL) return NULL;	
 		
@@ -1592,7 +1555,6 @@ static void register_main_before(xlua_cmd * cmd)
 }
 xlua_cmd * xlua_create_cmd(const char * name, const char * desc)
 {
-	//printf("ERROR: xTLua cannot create command - %s - use xLua and wrap them here.\n",name);
 	//return NULL;
 	
 	
@@ -1604,7 +1566,6 @@ xlua_cmd * xlua_create_cmd(const char * name, const char * desc)
 
 //	if(XPLMFindCommand(name) != NULL)
 //	{
-//		printf("ERROR: command already in use by other plugin or X-Plane: %s\n", name);
 //		return NULL;
 //	}
 
@@ -1613,7 +1574,6 @@ xlua_cmd * xlua_create_cmd(const char * name, const char * desc)
 	l_cmds = nc;
 	nc->m_name = name;
 	nc->m_cmd = XPLMCreateCommand(name,desc);
-	//printf("NULLCommandHandler %s\n",nc->m_name.c_str());
 	
 	return nc;
 }
@@ -1626,7 +1586,7 @@ void xtlua_cmd_install_handler(xtlua_cmd * cmd, xtlua_cmd_handler_f handler, voi
 		std::lock_guard<std::mutex> lock(data_mutex);
 		if(cmd->m_main_handler != NULL)
 		{
-			printf("ERROR: there is already a main handler installed: %s.\n", cmd->m_name.c_str());
+			log_message(nullptr, "there is already a main handler installed: %s.\n", cmd->m_name.c_str());
 			return;
 		}
 		cmd->m_main_handler = handler;
@@ -1639,7 +1599,7 @@ void xlua_cmd_install_handler(xlua_cmd * cmd, xlua_cmd_handler_f handler, void *
 	if(!cmd || !cmd->m_cmd || !handler) return;
 	if(cmd->m_main_handler != NULL)
 	{
-		printf("ERROR: there is already a main handler installed: %s.\n", cmd->m_name.c_str());
+		log_message(nullptr, "there is already a main handler installed: %s.\n", cmd->m_name.c_str());
 		return;
 	}
 	cmd->m_main_handler = handler;
@@ -1651,7 +1611,7 @@ void xlua_cmd_install_pre_wrapper(xlua_cmd * cmd, xlua_cmd_handler_f handler, vo
 {
 	if(!cmd || !cmd->m_cmd || !handler) return;
 	if(cmd->m_pre_handler) {
-		printf("ERROR: there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
+		log_message(nullptr, "there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
 		return;
 	}
 	cmd->m_pre_handler = handler;
@@ -1663,7 +1623,7 @@ void xlua_cmd_install_post_wrapper(xlua_cmd * cmd, xlua_cmd_handler_f handler, v
 {
 	if(!cmd || !cmd->m_cmd || !handler) return;
 	if(cmd->m_post_handler) {
-		printf("ERROR: there is already a post handler installed: %s.\n", cmd->m_name.c_str());
+		log_message(nullptr, "there is already a post handler installed: %s.\n", cmd->m_name.c_str());
 		return;
 	}
 	cmd->m_post_handler = handler;
@@ -1678,7 +1638,7 @@ void xlua_cmd_install_filter(xlua_cmd * cmd, xlua_cmd_filter_f filter, void * re
 {
 	if(!cmd || !cmd->m_cmd || !filter) return;
 	if(cmd->m_filter) {
-		printf("ERROR: there is already a command filter installed: %s.\n", cmd->m_name.c_str());
+		log_message(nullptr, "there is already a command filter installed: %s.\n", cmd->m_name.c_str());
 		return;
 	}
 	cmd->m_filter = filter;
@@ -1694,7 +1654,7 @@ void xtlua_cmd_install_pre_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler,
 		std::lock_guard<std::mutex> lock(data_mutex);
 		if(cmd->m_pre_handler != NULL)
 		{
-			printf("ERROR: there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
+			log_message(nullptr, "there is already a pre handler installed: %s.\n", cmd->m_name.c_str());
 			return;
 		}
 		cmd->m_pre_handler = handler;
@@ -1711,7 +1671,7 @@ void xtlua_cmd_install_post_wrapper(xtlua_cmd * cmd, xtlua_cmd_handler_f handler
 		std::lock_guard<std::mutex> lock(data_mutex);
 		if(cmd->m_post_handler != NULL)
 		{
-			printf("ERROR: there is already a post handler installed: %s.\n", cmd->m_name.c_str());
+			log_message(nullptr, "there is already a post handler installed: %s.\n", cmd->m_name.c_str());
 			return;
 		}
 		cmd->m_post_handler = handler;

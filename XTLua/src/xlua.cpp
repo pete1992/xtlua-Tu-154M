@@ -68,10 +68,6 @@
 #include "SerialWidget.h"
 using std::vector;
 
-/*
-    TODO: get good errors on compile error.
-    TODO: pipe output somewhere useful.
- */
 extern "C" {
 #include "lua.h"
 #include "lualib.h"
@@ -142,6 +138,11 @@ static bool g_script_cleanup_active = false;
 static int performScriptReload();
 static bool g_xlua2_reload_on_flight_change = false;
 static bool g_plugin_enabled = false;
+static bool g_host_transition_active = false; // Main thread, including SDK reentry.
+struct HostTransitionScope {
+    HostTransitionScope() { g_host_transition_active = true; }
+    ~HostTransitionScope() { g_host_transition_active = false; }
+};
 static std::unordered_map<int, string> g_xlua2_event_param_types;
 
 void xlua_register_event(int event_id, const char * event_param_type)
@@ -198,7 +199,6 @@ if(loadedModules&&xtlua_dref_resolveDREFQueue()==0&&!ready){
             ready=true;
         }
         g_worker_state_changed.notify_all();
-        printf("XTLua: xtlua_worker DataRef bridge ready on X-Plane thread\n");
     }
     if(ready)
         xtlua_dref_preUpdate();
@@ -316,10 +316,8 @@ static void findXTScripts(){
             }
             else
             {
-                string message = "XTLua: refusing unsupported XLua marker in ";
-                message += script_path;
-                message += "; use exact first line --[[ XLua 2.0 ]]\n";
-                XPLMDebugString(message.c_str());
+                log_message(nullptr, "%s: unsupported XLua marker; use exact first line --[[ XLua 2.0 ]]\n",
+                    script_path.c_str());
             }
         }
         ++offset;
@@ -330,11 +328,8 @@ static void findXTScripts(){
     dirtyXTScripts=true;
 }
 static void loadXTScripts(){
-    printf("XTLua: xtlua_worker loading scripts %d\n",myID);
-    printf("XTLua: xtlua_worker init %s\n",init_script_path.c_str());
     for(int i=0;i<static_cast<int>(script_paths.size());i++)
     {
-            printf("XTLua: xtlua_worker loading %s\n",script_paths[i].c_str());
 #if !MOBILE
             xtlua_worker_modules.push_back(new module(
                             mod_paths[i].c_str(),
@@ -368,7 +363,8 @@ static bool loadXLua2Scripts()
         }
         else
         {
-            XPLMDebugString("XTLua: xlua2_main module failed during load/start; refusing host startup\n");
+            log_message(nullptr, "xlua2_main: %s: load/XPluginStart failed; refusing host startup\n",
+                candidate->get_script_path().c_str());
             delete candidate;
             return false;
         }
@@ -503,9 +499,7 @@ static int performScriptReload(){
         }
 
         // Pause xtlua_worker before the X-Plane thread reloads scripts.
-        printf("XTLua: xtlua_worker pausing for script reload\n");
         pauseWorker();
-        printf("XTLua: xtlua_worker paused for script reload\n");
         loadedModules=false;
         ready=false;
         // Keep the currently executing host flight loop alive. Its next tick
@@ -551,13 +545,11 @@ static int performScriptReload(){
         xlua_add_callout("flight_start");
         xlua_setLoadStatus(1);
         resumeWorker(g_plugin_enabled);
-        printf("XTLua: script runtimes active after reload\n");
     }
 
     return 0;
 }
 void do_during_physics(){
-    printf("XTLua: xtlua_worker thread open %d\n",myID);
     for(;;){
         bool load_scripts = false;
         {
@@ -580,7 +572,6 @@ void do_during_physics(){
             if(load_scripts){
                 loadXTScripts();
                 loadedModules=true;
-                printf("XTLua: xtlua_worker scripts loaded; waiting for DataRef bridge\n");
             }
             else{
                 std::vector<XTCmd*> runItems=get_runQueue();
@@ -598,7 +589,6 @@ void do_during_physics(){
                 std::vector<string> msgItems=get_runMessages();
 
                 for(string item:msgItems){
-                        printf("XTLua: xtlua_worker callout %s\n",item.c_str());
 
                         for(vector<module *>::iterator m = xtlua_worker_modules.begin(); m != xtlua_worker_modules.end(); ++m)
                             (*m)->do_callout(item.c_str());
@@ -622,7 +612,7 @@ void do_during_physics(){
             }
         }
         catch(...){
-            xtlua_queue_log("XTLua: xtlua_worker exception; runtime paused\n");
+            log_message(nullptr, "xtlua_worker exception; runtime paused\n");
             active=false;
             // Do not spin retrying an incomplete load. An explicit reload
             // uses SDK plugin reload while the bridge is not ready.
@@ -639,9 +629,6 @@ void do_during_physics(){
             g_worker_state_changed.wait_for(lock, min_frame - elapsed, [] {
                 return !run || g_worker_pause_requested;
             });
-        else if(!load_scripts && elapsed > std::chrono::milliseconds(30))
-            printf("XTLua: xtlua_worker cycle exceeded budget: %d ms\n",
-                static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
     }
 
     if(g_is_acf_inited)
@@ -650,7 +637,6 @@ void do_during_physics(){
             (*m)->acf_unload();
     }
     sleeping=true;
-    printf("XTLua: xtlua_worker thread stopped %d\n",myID);
 }
 std::vector<std::thread> threads;
 int XTLuaXPluginStart(char * outSig)
@@ -666,6 +652,7 @@ int XTLuaXPluginStart(char * outSig)
     g_worker_pause_requested=false;
     g_worker_busy=false;
     g_plugin_enabled=false;
+    g_host_transition_active=false;
     g_xlua2_reload_requested=false;
     g_script_reload_requested=false;
     g_script_cleanup_active=false;
@@ -707,7 +694,6 @@ int XTLuaXPluginStart(char * outSig)
         while(xtlua_flush_log_queue() != 0) {}
         return 0;
     }
-    printf("XTLua: host plug-in started on X-Plane thread: %s\n",outSig != NULL ? outSig : "");
     threads.push_back(std::thread(do_during_physics));
     xtlua_flush_log_queue();
 
@@ -716,6 +702,7 @@ int XTLuaXPluginStart(char * outSig)
 
 void	XTLuaXPluginStop(void)
 {
+    const HostTransitionScope transition;
     {
         std::lock_guard<std::mutex> lock(g_worker_state_mutex);
         run=false;
@@ -730,26 +717,35 @@ void	XTLuaXPluginStop(void)
     cleanupScripts();
     xlua_callback_shutdown();
     g_xlua2_event_param_types.clear();
+    // X-Plane normally calls Disable first; Stop must not duplicate its line.
+    if(g_plugin_enabled)
+    {
+        g_plugin_enabled=false;
+        xtlua_queue_log("XTLua: host unlinked\n");
+    }
     while(xtlua_flush_log_queue() != 0) {}
-    printf("XTLua: host plug-in stopped on X-Plane thread: %d\n",myID);
 }
 
 void XTLuaXPluginDisable(void)
 {
-    printf("XTLua: host disabling; waiting for xtlua_worker to pause\n");
-    XPLMDebugString("XTLua: host disabling; waiting for xtlua_worker to pause\n");
+    if(g_host_transition_active) return;
+    const HostTransitionScope transition;
+    const bool was_enabled = g_plugin_enabled;
     pauseWorker();
+    g_plugin_enabled=false;
     for(module * m : xlua2_main_modules)
         m->xplugin_disable();
-    g_plugin_enabled=false;
+    if(was_enabled)
+        xtlua_queue_log("XTLua: host unlinked\n");
     xtlua_flush_log_queue();
-    printf("XTLua: xtlua_worker paused; host disabled\n");
 }
 
 int XTLuaXPluginEnable(void)
 {
-    printf("XTLua: host enabling on X-Plane thread: %d\n", XPLMGetMyID());
-    XPLMDebugString("XTLua: relinking DataRefs on X-Plane thread\n");
+    if(g_host_transition_active) return 0;
+    if(g_plugin_enabled) return 1;
+    const HostTransitionScope transition;
+    xtlua_queue_log("XTLua: relinking DataRefs on X-Plane thread\n");
     xlua_relink_all_drefs();
     size_t enabled_count = 0;
     for(module * m : xlua2_main_modules)
@@ -764,7 +760,8 @@ int XTLuaXPluginEnable(void)
                 xlua2_main_modules[--enabled_count]->xplugin_disable();
             g_plugin_enabled=false;
             active=false;
-            XPLMDebugString("XTLua: an xlua2_main module declined XPluginEnable; host remains disabled\n");
+            log_message(nullptr, "xlua2_main: %s: XPluginEnable failed or declined; host remains disabled\n",
+                m->get_script_path().c_str());
             xtlua_flush_log_queue();
             return 0;
         }
@@ -772,7 +769,7 @@ int XTLuaXPluginEnable(void)
     }
     g_plugin_enabled=true;
     resumeWorker(true);
-    XPLMDebugString("XTLua: host enabled; xtlua_worker active\n");
+    xtlua_queue_log("XTLua: host enabled; xtlua_worker active\n");
     xtlua_flush_log_queue();
     return 1;
 }

@@ -88,22 +88,13 @@ static char s_module_registry_key;
 // FIX M7: Es gibt in dieser Datei keine direkten printf-Aufrufe fuer
 // Modulfehler oder Modul-Trace mehr.
 //   - Fehler laufen ueber module_log() -> Logqueue -> Main-Thread (Log.txt).
-//   - Reine Fortschrittsmeldungen sind hinter XTLUA_MODULE_TRACE versteckt und
-//     per Default AUS, weil sie beim Laden vieler Module das Log zumuellen.
+//   - Routine- und Print-Logging sind entfernt, ohne Textfilter/Trace-Schalter.
+//   - Lua error()/assert() und log_error() behalten den Skriptpfad im Fehlerlog.
 //
 // Threading-Hinweis: Alle Runtimes verwenden dieselbe FIFO-Textqueue.
 // Weder der Worker noch die Logger in dieser Datei rufen XPLM direkt auf.
-// Beides laesst sich beim Build ueberschreiben (-DXTLUA_MODULE_LOG=0 usw.).
 //==============================================================================
 
-#ifndef XTLUA_MODULE_LOG
-	#define XTLUA_MODULE_LOG 1      // Fehlermeldungen: an
-#endif
-#ifndef XTLUA_MODULE_TRACE
-	#define XTLUA_MODULE_TRACE 0    // Fortschrittsmeldungen: aus
-#endif
-
-#if XTLUA_MODULE_LOG
 #if defined(__GNUC__) || defined(__clang__)
 	#define XTLUA_PRINTFLIKE __attribute__((format(printf,1,2)))
 #else
@@ -122,15 +113,6 @@ static void module_log(const char * fmt, ...)
 	buf[sizeof(buf) - 1] = 0;
 	xtlua_queue_log(buf);
 }
-#else
-static void module_log(const char *, ...) { }
-#endif
-
-#if XTLUA_MODULE_TRACE
-	#define MODULE_TRACE(...) module_log(__VA_ARGS__)
-#else
-	#define MODULE_TRACE(...) ((void) 0)
-#endif
 
 //==============================================================================
 // 1. PFAD-HELFER
@@ -256,45 +238,19 @@ static void guard_xlua2_bindings(lua_State * L)
 	}
 }
 
-static int module_print(lua_State * L)
+static int module_noop_print(lua_State *)
 {
-	// Use Lua's tostring contract (including __tostring) before owning C++
-	// strings, so a Lua error cannot skip their destructors through longjmp.
-	const int argument_count = lua_gettop(L);
-	luaL_Buffer buffer;
-	luaL_buffinit(L, &buffer);
-	for(int i = 1; i <= argument_count; ++i)
-	{
-		if(i > 1)
-			luaL_addchar(&buffer, '\t');
-		lua_getglobal(L, "tostring");
-		lua_pushvalue(L, i);
-		lua_call(L, 1, 1);
-		size_t length = 0;
-		const char * value = lua_tolstring(L, -1, &length);
-		if(value == NULL)
-			return luaL_error(L, "tostring must return a string for print");
-		luaL_addvalue(&buffer); // consumes the value, including buffer flushes
-	}
-	luaL_pushresult(&buffer);
-	size_t length = 0;
-	const char * output = lua_tolstring(L, -1, &length);
-	module * owner = module::module_from_interp(L);
-	string log_line("XTLua: ");
-	if(owner != NULL)
-	{
-		switch(owner->get_runtime())
-		{
-		case module_runtime::xtlua_worker: log_line += "xtlua_worker: "; break;
-		case module_runtime::xtlua_main: log_line += "xtlua_main: "; break;
-		case module_runtime::xlua2_main: log_line += "xlua2_main: "; break;
-		}
-		log_line += owner->get_script_path();
-		log_line += ": ";
-	}
-	log_line.append(output, length);
-	log_line += '\n';
-	xtlua_queue_log(std::move(log_line));
+	// Keep old aircraft scripts callable, without formatting, inspecting or
+	// forwarding any routine output. This is not a severity/text filter.
+	return 0;
+}
+
+static int module_log_error(lua_State * L)
+{
+	// Explicit, non-throwing error reporting. error()/assert() keep their
+	// normal Lua semantics and are logged by the protected callback boundary.
+	const char * message = luaL_checkstring(L, 1);
+	log_message(L, "%s\n", message);
 	return 0;
 }
 
@@ -371,7 +327,7 @@ static module_alloc_block * make_alloc_block(size_t payload)
 	module_alloc_block * r = (module_alloc_block *) malloc(hdr + payload);
 	if(r == NULL)
 	{
-		module_log("xtlua: module allocator out of memory (%zu bytes)\n",
+		module_log("XTLua: ERROR: module allocator out of memory (%zu bytes)\n",
 				   hdr + payload);
 		return NULL;
 	}
@@ -457,7 +413,7 @@ static void destroy_alloc_block(module_alloc_block * head)
 // Scheitern daran, dass m_interp == NULL ist (so wie im Original).
 #define CTOR_FAIL(errcode,msg)                                              \
 	if((errcode) != 0) {                                                    \
-		module_log("xtlua: %s failed (%d): %s\n",                           \
+		log_message(m_interp, "%s failed (%d): %s\n",                       \
 				   (msg), (int)(errcode), safe_lua_error(m_interp));         \
 		shutdown_lua();                                                       \
 		return; }
@@ -482,7 +438,7 @@ module::module(
 	// (length_of_dir, luaL_loadbuffer-Chunkname, fopen).
 	if(in_module_path == NULL || in_init_script == NULL || in_module_script == NULL)
 	{
-		module_log("xtlua: module ctor called with NULL path "
+		module_log("XTLua: ERROR: module ctor called with NULL path "
 				   "(module=%s init=%s script=%s)\n",
 				   in_module_path   ? in_module_path   : "(null)",
 				   in_init_script   ? in_init_script   : "(null)",
@@ -495,19 +451,11 @@ module::module(
 	const char *    init_chunk   = chunk_name_for(in_init_script,   boiler_plate_paths);
 	const char *    module_chunk = chunk_name_for(in_module_script, boiler_plate_paths);
 
-	// FIX M7: Runtime-spezifisches Start-Trace statt ungefiltertem printf.
-	if(m_runtime == module_runtime::xtlua_worker)
-		MODULE_TRACE("xtlua_worker: running module %s\n", module_chunk);
-	else if(m_runtime == module_runtime::xtlua_main)
-		MODULE_TRACE("xtlua_main: running module %s\n", module_chunk);
-	else if(m_runtime == module_runtime::xlua2_main)
-		MODULE_TRACE("xlua2_main: running module %s\n", module_chunk);
-
 	// ---- Lua-State aufsetzen -------------------------------------------------
 	m_interp = luaL_newstate();
 	if(m_interp == NULL)
 	{
-		module_log("xtlua: unable to set up Lua for %s\n", module_chunk);
+		module_log("XTLua: ERROR: unable to set up Lua for %s\n", in_module_script);
 		return;
 	}
 	if(m_runtime == module_runtime::xlua2_main)
@@ -563,7 +511,8 @@ module::module(
 			m_runtime == module_runtime::xtlua_worker);
 	}
 	xtlua_register_render_bridge(m_interp, m_runtime);
-	lua_register(m_interp, "print", module_print);
+	lua_register(m_interp, "print", module_noop_print);
+	lua_register(m_interp, "log_error", module_log_error);
 
 	// ---- init-Skript laden und ausfuehren -----------------------------------
 	// Mobile devices like Android don't use a regular file system... they have a
@@ -573,7 +522,7 @@ module::module(
 	{
 		// Hinweis: Hier liegt KEINE Lua-Fehlermeldung auf dem Stack - genau der
 		// Fall, der in der urspruenglichen Implementierung zu UB in lua_tostring fuehrte.
-		module_log("xtlua: cannot read init script '%s'\n", in_init_script);
+		log_message(m_interp, "cannot read init script '%s'\n", in_init_script);
 		shutdown_lua();
 		return;
 	}
@@ -605,7 +554,7 @@ module::module(
 		lua_getfield(m_interp, LUA_GLOBALSINDEX, "run_module_in_namespace");
 		if(!lua_isfunction(m_interp, -1))
 		{
-			module_log("xtlua: init script '%s' did not define "
+			log_message(m_interp, "init script '%s' did not define "
 					   "run_module_in_namespace()\n", init_chunk);
 			shutdown_lua();
 			return;
@@ -615,7 +564,7 @@ module::module(
 	xmap_class lmod(in_module_script);
 	if(!lmod.exists())
 	{
-		module_log("xtlua: cannot read module script '%s'\n", in_module_script);
+		log_message(m_interp, "cannot read module script '%s'\n", in_module_script);
 		shutdown_lua();
 		return;
 	}
@@ -830,8 +779,7 @@ bool module::xplugin_start()
 		if(lua_isboolean(m_interp, -1))
 			result = lua_toboolean(m_interp, -1) != 0;
 		else
-			module_log("xtlua: %s XPluginStart must return a boolean\n",
-				m_script_path.c_str());
+			log_message(m_interp, "XPluginStart must return a boolean\n");
 		lua_pop(m_interp, 1);
 	}
 	m_started = result;
@@ -859,8 +807,7 @@ bool module::xplugin_enable()
 		if(lua_isboolean(m_interp, -1))
 			result = lua_toboolean(m_interp, -1) != 0;
 		else
-			module_log("xtlua: %s XPluginEnable must return a boolean\n",
-				m_script_path.c_str());
+			log_message(m_interp, "XPluginEnable must return a boolean\n");
 		lua_pop(m_interp, 1);
 	}
 	m_enabled = result;
@@ -931,8 +878,8 @@ void module::xplugin_receive_message(
 
 	if(lua_pcall(m_interp, 3, 0, debug_index) != 0)
 	{
-		module_log("xtlua: %s XPluginReceiveMessage failed: %s\n",
-			m_script_path.c_str(), safe_lua_error(m_interp));
+		log_message(m_interp, "XPluginReceiveMessage failed: %s\n",
+			safe_lua_error(m_interp));
 		lua_pop(m_interp, 1);
 	}
 	lua_remove(m_interp, debug_index);

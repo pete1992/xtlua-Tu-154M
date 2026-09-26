@@ -23,7 +23,7 @@ static void serial_error(const char* message) noexcept
 {
     // Never log the serial key or let an error while formatting/queueing a
     // diagnostic escape through a native X-Plane callback.
-    try { xtlua_queue_log(std::string("XTLua SerialWidget: ") + message + "\n"); }
+    try { log_message(nullptr, "SerialWidget: %s\n", message); }
     catch(...) {}
 }
 
@@ -99,7 +99,6 @@ void SerialWidget::show(){
         char activation_Text[1024]={0};
         //nt size=
         XPLMGetDatab(sDref,activation_Text,0,sizeof(activation_Text) - 1);
-        //printf("startup is activated text=%s\n",activation_Text);
         if((std::string(activation_Text)).compare("true")==0){
              return;
         }
@@ -195,14 +194,12 @@ int serialwindowHandler(
             std::string str(buffer);
             serial+=str+"-";
         }
-        //printf("%s\n%s\n",serialWindow.getdRef().c_str(),serial.c_str());
         XPLMDataRef sDref = XPLMFindDataRef (serialWindow.getdRef().c_str());
         if(sDref!=NULL){
             XPLMSetDatab(sDref,(void *)serial.c_str(),0,(int)serial.size());
             char activation_Text[1024]={0};
             //int size=
             XPLMGetDatab(sDref,activation_Text,0,sizeof(activation_Text) - 1);
-            //printf("is activated text=%s\n",activation_Text);
             if((std::string(activation_Text)).compare("true")==0){
                 close_serial_window();
                 FILE *fptr;
@@ -216,7 +213,6 @@ int serialwindowHandler(
                 lp = plugin_base_path.find_last_of("/\\");
                 plugin_base_path.erase(lp+1);
                 plugin_base_path+="serial.bin";
-                printf("save serial to %s\n",plugin_base_path.c_str());
                 fptr=fopen(plugin_base_path.c_str(),"w");
                 if(fptr != nullptr)
                 {

@@ -182,13 +182,11 @@ void XTLuaDataRefs::updateCommandsImpl(){
             // Preserve FIFO for this command, while allowing an unrelated
             // held command to receive its End. No unresolved phase is dropped.
             blockedNames.insert(request.name);
-            if(unresolvedCommands.insert(request.name).second)
-                xtlua_queue_log("XTLua: waiting for command " + request.name + "\n");
+
             pending.push_back(std::move(request));
             continue;
         }
         if(known == resolvedCommands.end()) resolvedCommands.emplace(request.name, command);
-        unresolvedCommands.erase(request.name);
         switch(request.action) {
         case CommandAction::begin:
             XPLMCommandBegin(command);
@@ -199,8 +197,6 @@ void XTLuaDataRefs::updateCommandsImpl(){
             if(held != heldCommands.end()) {
                 XPLMCommandEnd(command);
                 if(--held->second == 0) heldCommands.erase(held);
-            } else {
-                xtlua_queue_log("XTLua: ignored unmatched command end: " + request.name + "\n");
             }
             break;
         }
@@ -220,11 +216,8 @@ void XTLuaDataRefs::updateCommandsImpl(){
          
          if(c->srcDref==NULL || c->dstDref==NULL){ // Retry unresolved bindings.
             XTControlObject candidate=*c;
-            printf("Do Create Override %s\n",candidate.data.c_str());
             json jData =json::parse(candidate.data);
-            printf("Find src %s\n",jData["srcDref"].get<std::string>().c_str());
             candidate.srcDref=XPLMFindDataRef(jData["srcDref"].get<std::string>().c_str());
-            printf("Find dst %s\n",jData["dstDref"].get<std::string>().c_str());
             candidate.dstDref=XPLMFindDataRef(jData["dstDref"].get<std::string>().c_str());
             candidate.dstIndex=-1;
             if(candidate.dstDref)
@@ -290,10 +283,9 @@ void XTLuaDataRefs::updateCommandsImpl(){
             else
                 newValues[c->dstDref]=newVal;
          }
-         else
-            printf("Cant Override %s\n",c->data.c_str());
+
       } catch(const std::exception& error) {
-          printf("XTLua: invalid control override: %s\n", error.what());
+          log_message(nullptr, "invalid control override: %s\n", error.what());
       }
     }
     for (auto x : newValues) {
@@ -319,7 +311,6 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
     json dVdata = json::array();
     dVdata[0]=currentView+1;
     const std::string displayedEntry=dVdata.dump();
-   // printf("currentView XPLMGetDisplayedFMSEntry=%d\n",currentView);
     json nVdata =json::array();
     float lastoutLat=0.0f;
     float lastoutLon=0.0f;
@@ -345,7 +336,6 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
               char                outName[256]={0};    
               char                outReg[1]={0};
               XPLMGetNavAidInfo(outRef,&outType2,&outLatitude,&outLongitude,&outHeight,&outFrequency,&outHeading,outID,outName,outReg);
-              //printf("getting XPLMGetNavAidInfo %d=%d, %d,%d ,%s\n",i,outRef,outType,outFrequency,outID); 
               double latDiff=outLatitude-outLat;
               if(latDiff>180)
                 latDiff-=360;
@@ -365,8 +355,8 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
               }
               else
               {
-                // char val[256];
-             //   sprintf(val,"%f %f",latDiff,lonDiff);
+                 char val[256];
+                sprintf(val,"%f %f",latDiff,lonDiff);
                  nVdata[count]=json::array({outRef,outType,0,0,outLat,outLon,string("latlon"),string("latlon"),outAltitude,(i==currentIndex)});
                  lastoutLat=outLat;
                 lastoutLon=outLon;
@@ -376,7 +366,6 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
               count++;
           }
           else{
-                //printf("getting XPLMGetNavAidInfo %d=%d, %d %f,%f ,%s\n",i,outRef,outType,outLat,outLon,outID); 
               if (!std::isnan(outLat)&&!std::isnan(outLon)) {  
                 nVdata[count]=json::array({outRef,outType,0,0,outLat,outLon,string("latlon"),string(outID),outAltitude,(i==currentIndex)});
                 count++;
@@ -416,11 +405,6 @@ void XTLuaDataRefs::updateNavDataRefsImpl(){
                 char                outName[256]={};    /* Can be NULL */
                 char                outReg[1]={};
                 XPLMGetNavAidInfo(nAid,&outType,&outLatitude,&outLongitude,&outHeight,&outFrequency,&outHeading,outID,outName,outReg);
-                /*double latDif=outLatitude-lat;
-                double lonDif=outLongitude-lon;
-                if(outType!=512&&latDif<2&&latDif>-2&&lonDif<2&&lonDif>-2)
-                //if(outType!=512)
-                    printf("%d=%d,%d,%f,%f,%f,%s\n",nAid,outType,outFrequency,latDif,lonDif,outHeading,outName); */
                 if(outType!=512) {
                     NavAid* item=new NavAid{nAid, outType, outLatitude, outLongitude,
                                            outFrequency, outHeading, outName, outID, nullptr};
@@ -509,7 +493,6 @@ void XTLuaDataRefs::update_localNavData(){
         latDif+=360; 
     if(latDif<0.5&&latDif>-0.5&&lonDif>-0.5&&lonDif<0.5)
         return;
-    //printf("update_localNavData\n");    
     int count=0;
     //int cSize=localNavaids.size();
     while(current_navaid!=NULL&&(count<40||firstPass)){
@@ -517,7 +500,6 @@ void XTLuaDataRefs::update_localNavData(){
         double lonDif=current_navaid->longitude-lon;
         if((current_navaid->type==8&&(latDif<10&&latDif>-10&&lonDif<10&&lonDif>-10))||(latDif<2&&latDif>-2&&lonDif<2&&lonDif>-2)){
             localNavaids[current_navaid->id]=current_navaid;
-            //printf("%d=%d,%d,%f,%f,%f,%s\n",current_navaid->id,current_navaid->type,current_navaid->frequency,latDif,lonDif,current_navaid->heading,current_navaid->name.c_str());
         }
         current_navaid=current_navaid->next;
         count++;
@@ -531,7 +513,6 @@ void XTLuaDataRefs::update_localNavData(){
                 skipNaviads=true;
             }
             firstPass=false;
-            //printf("completed pass\n");
         }
     }
     
@@ -813,7 +794,6 @@ void XTLuaDataRefs::cleanup(){
     auto held=std::move(heldCommands);
     heldCommands.clear();
     resolvedCommands.clear();
-    unresolvedCommands.clear();
     for(const auto& entry : held)
         for(unsigned i=0; i<entry.second; ++i) XPLMCommandEnd(entry.first);
     // Camera state is main-owned and released before caches are destroyed.
@@ -1118,12 +1098,10 @@ int XTLuaCameraFunc(
 		outCameraPosition->heading = camData[4];
 		outCameraPosition->roll = 0;		
         outCameraPosition->zoom = 1.0f;
-        //printf("XTLua Did Cam Control %f %f %f %f %f\n",camData[0],camData[1],camData[2],camData[3],camData[4]);
 	}
     else{
         controllingCam=false;
     }
-    //printf("XTLua Cam Control %f %f %f %f %f\n",camData[0],camData[1],camData[2],camData[3],camData[4]);
     /* Return 0 to indicate we do not want to keep controlling the camera. */
     int retVal=wantsCamera;
     if(retVal==0){
@@ -1166,7 +1144,7 @@ void XTLuaDataRefs::updateMainThreadRequests(){
         try {
             applyMainThreadRequest(request);
         } catch(const std::exception& error) {
-            printf("XTLua: invalid main-thread request %s: %s\n",
+            log_message(nullptr, "invalid main-thread request %s: %s\n",
                    request.name.c_str(), error.what());
         }
     }

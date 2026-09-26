@@ -168,7 +168,6 @@ private:
     std::vector<MainThreadRequest> mainThreadQueue;
     std::unordered_map<std::string, XPLMCommandRef> resolvedCommands; // Main thread only; SDK refs live for plugin lifetime.
     std::unordered_map<XPLMCommandRef, unsigned> heldCommands; // Main thread only.
-    std::unordered_set<std::string> unresolvedCommands; // Main-thread diagnostic suppression.
     bool acceptingRequests=true; // Protected by data_mutex.
     bool cleaning=false;
     void updateMainThreadRequests();

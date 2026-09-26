@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include "../xtlua2_imgui.h"
+#include "../shared_xpfuncs.h"
 
 extern "C" {
   #include "lua.h"
@@ -476,14 +477,13 @@ static void ImEndStack(int type);
 // returns NULL on success and error string on error
 const char * RunString(const char* szLua) {
   if (!lState) {
-    fprintf(stderr, "You didn't assign the global lState, either assign that or refactor LoadImguiBindings and RunString\n");
+    log_message(nullptr, "ImGui RunString requires an assigned Lua state\n");
     return "RunString requires an assigned Lua state";
   }
 
   int iStatus = luaL_loadstring(lState, szLua);
   if(iStatus) {
     return lua_tostring(lState, -1);
-    //fprintf(stderr, "Lua syntax error: %s\n", lua_tostring(lState, -1));
     //return;
   }
 #ifdef ENABLE_IM_LUA_END_STACK
@@ -502,7 +502,6 @@ const char * RunString(const char* szLua) {
   if( iStatus )
   {
       return lua_tostring(lState, -1);
-      //fprintf(stderr, "Error: %s\n", lua_tostring( lState, -1 ));
       //return;
   }
 #ifdef ENABLE_IM_LUA_END_STACK
