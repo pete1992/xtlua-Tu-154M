@@ -54,6 +54,13 @@ display state, not XPLM handles or draw commands. See [PHASE2_README.md](PHASE2_
 for API examples, limits and verification status.
 
 
+### Windows: statically embedded LuaJIT
+
+The Visual Studio x64 project links the prebuilt `lua_sdk/luajit_static.lib` archive
+directly. LuaJIT is not rebuilt. See
+[STATIC_LUAJIT_README.md](STATIC_LUAJIT_README.md) for the exact library path
+and verification limits.
+
 OLD README
 ====
 
